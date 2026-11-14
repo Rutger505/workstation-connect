@@ -45,6 +45,8 @@ enum Command {
     Browse,
     /// Phone screen in a window (scrcpy over wireless debugging).
     Screen,
+    /// One-time kdeconnectd setup: notifications to phone, Bluetooth link, share folder.
+    Setup,
 }
 
 #[tokio::main]
@@ -68,6 +70,7 @@ async fn main() -> Result<()> {
         Command::Send { files } => actions::run(actions::Action::SendFiles, files).await,
         Command::Browse => actions::run(actions::Action::Browse, vec![]).await,
         Command::Screen => actions::run(actions::Action::Screen, vec![]).await,
+        Command::Setup => actions::setup().await,
         cmd => {
             let req = match cmd {
                 Command::Pause => "pause",

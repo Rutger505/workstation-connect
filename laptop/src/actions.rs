@@ -84,6 +84,65 @@ pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
     }
 }
 
+/// One-time kdeconnectd setup for the phone: laptop notifications → phone, Bluetooth link (no shared
+/// network needed), incoming files/photos folder. Safe to re-run.
+pub async fn setup() -> Result<()> {
+    let cfg = Config::load().ok();
+    let kde = Kde::connect().await?;
+    let id = phone(&kde).await?;
+    let p = kde.phone(&id).await?;
+    println!("phone: {} ({id})", p.name);
+
+    kde.set_plugin(&id, "kdeconnect_sendnotifications", true)
+        .await?;
+    println!("laptop notifications → phone: on");
+
+    match kde
+        .link_providers()
+        .await?
+        .into_iter()
+        .find(|(p, _)| p == "bluetooth")
+    {
+        Some((_, true)) => println!("bluetooth link: on"),
+        Some((_, false)) => {
+            kde.set_link_provider("bluetooth", true).await?;
+            println!("bluetooth link: turned on");
+        }
+        None => println!("bluetooth link: not built into this kdeconnect (needs qt6-connectivity)"),
+    }
+
+    if let Some(dir) = cfg.and_then(|c| c.share_dir) {
+        let dir = expand_home(&dir);
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let conf = crate::config::xdg_config()
+            .join("kdeconnect")
+            .join(&id)
+            .join("kdeconnect_share");
+        std::fs::create_dir_all(&conf)?;
+        let file = conf.join("config");
+        let old = std::fs::read_to_string(&file).unwrap_or_default();
+        std::fs::write(
+            &file,
+            crate::kde::set_ini(&old, "incoming_path", &dir.to_string_lossy()),
+        )?;
+        println!("files/photos from phone → {}", dir.display());
+    } else {
+        println!(
+            "files/photos from phone → kdeconnect default (~/Downloads); set share_dir in config.toml to change"
+        );
+    }
+    Ok(())
+}
+
+fn expand_home(p: &str) -> std::path::PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest)
+        }
+        None => p.into(),
+    }
+}
+
 /// Launcher menu (walker/fuzzel/wofi/rofi in dmenu mode, or config `menu`).
 pub async fn menu() -> Result<()> {
     let cmd = match Config::load().ok().and_then(|c| c.menu) {

@@ -22,19 +22,24 @@ pub struct Config {
     pub kdeconnect_device: Option<String>,
     /// Menu command reading entries on stdin (dmenu mode). Default: walker/fuzzel/wofi/rofi, first found.
     pub menu: Option<Vec<String>>,
+    /// Folder for files/photos shared from the phone (`wsconnect setup` applies it), e.g. "~/Pictures/Phone".
+    pub share_dir: Option<String>,
 }
 
 fn default_offline_secs() -> u64 {
     10
 }
 
-pub fn dir() -> PathBuf {
+pub fn xdg_config() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
         })
-        .join("workstation-connect")
+}
+
+pub fn dir() -> PathBuf {
+    xdg_config().join("workstation-connect")
 }
 
 impl Config {

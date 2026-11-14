@@ -195,7 +195,7 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if let Some(e) = daemon.and_then(|v| v["error"].as_str()) {
         tip.push(format!("error: {e}"));
     }
-    tip.push("click: pause/resume · right-click: menu".into());
+    tip.push("click: pause/resume everything · right-click: menu".into());
 
     let class = match mode {
         None => "down",

@@ -508,6 +508,11 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
                 });
             }
         }
+        tokio::spawn(async move {
+            if let Err(e) = crate::kde::pause_sync(on).await {
+                warn!("kde connect pause={on}: {e:#}");
+            }
+        });
         info!("paused: {on}");
     };
     match line.trim() {

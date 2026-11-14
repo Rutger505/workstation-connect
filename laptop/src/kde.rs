@@ -170,6 +170,96 @@ impl Kde {
     }
 }
 
+impl Kde {
+    pub async fn set_plugin(&self, id: &str, plugin: &str, on: bool) -> Result<()> {
+        let dev = self.device(id, None, "org.kde.kdeconnect.device").await?;
+        Ok(dev.call("setPluginEnabled", &(plugin, on)).await?)
+    }
+
+    /// Link providers as (id, enabled), e.g. ("bluetooth", true).
+    pub async fn link_providers(&self) -> Result<Vec<(String, bool)>> {
+        let daemon = self.proxy(ROOT.into(), "org.kde.kdeconnect.daemon").await?;
+        let lines: Vec<String> = daemon.call("linkProviders", &()).await?;
+        Ok(lines.iter().filter_map(|l| parse_provider(l)).collect())
+    }
+
+    pub async fn set_link_provider(&self, provider: &str, on: bool) -> Result<()> {
+        let daemon = self.proxy(ROOT.into(), "org.kde.kdeconnect.daemon").await?;
+        Ok(daemon.call("setLinkProviderState", &(provider, on)).await?)
+    }
+}
+
+/// Pause = KDE Connect fully off too: disables every enabled link provider and remembers which
+/// ones (file in XDG_RUNTIME_DIR, survives daemon restarts); resume re-enables exactly those.
+pub async fn pause_sync(on: bool) -> Result<()> {
+    let state = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("wsconnect-paused-providers");
+    let kde = Kde::connect().await?;
+    if on {
+        let enabled: Vec<String> = kde
+            .link_providers()
+            .await?
+            .into_iter()
+            .filter(|(_, e)| *e)
+            .map(|(id, _)| id)
+            .collect();
+        if enabled.is_empty() {
+            return Ok(()); // already paused (or nothing on): keep the remembered list
+        }
+        std::fs::write(&state, enabled.join("\n"))?;
+        for id in &enabled {
+            kde.set_link_provider(id, false).await?;
+        }
+    } else {
+        let Ok(text) = std::fs::read_to_string(&state) else {
+            return Ok(());
+        };
+        for id in text.lines().filter(|l| !l.is_empty()) {
+            kde.set_link_provider(id, true).await?;
+        }
+        std::fs::remove_file(&state)?;
+    }
+    Ok(())
+}
+
+/// "Bluetooth|bluetooth|enabled" → ("bluetooth", true)
+fn parse_provider(line: &str) -> Option<(String, bool)> {
+    let mut parts = line.split('|');
+    let (_name, id, state) = (parts.next()?, parts.next()?, parts.next()?);
+    Some((id.to_string(), state == "enabled"))
+}
+
+/// Sets `key=value` in the [General] section of a QSettings INI file (kdeconnectd plugin config).
+pub fn set_ini(text: &str, key: &str, value: &str) -> String {
+    let mut out = Vec::new();
+    let (mut in_general, mut seen_general, mut done) = (false, false, false);
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            if in_general && !done {
+                out.push(format!("{key}={value}"));
+                done = true;
+            }
+            in_general = t == "[General]";
+            seen_general |= in_general;
+        } else if in_general && t.split('=').next().map(str::trim) == Some(key) {
+            out.push(format!("{key}={value}"));
+            done = true;
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if !done {
+        if !seen_general {
+            out.push("[General]".into());
+        }
+        out.push(format!("{key}={value}"));
+    }
+    out.join("\n") + "\n"
+}
+
 /// file:// URL for a local path (absolute), percent-encoding what URLs can't hold.
 pub fn file_url(path: &std::path::Path) -> Result<String> {
     let abs = std::path::absolute(path)?;
@@ -188,6 +278,35 @@ pub fn file_url(path: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_providers() {
+        assert_eq!(
+            parse_provider("Bluetooth|bluetooth|disabled"),
+            Some(("bluetooth".into(), false))
+        );
+        assert_eq!(parse_provider("garbage"), None);
+    }
+
+    #[test]
+    fn edits_ini() {
+        assert_eq!(
+            set_ini("", "incoming_path", "/x"),
+            "[General]\nincoming_path=/x\n"
+        );
+        assert_eq!(
+            set_ini(
+                "[General]\nincoming_path=/old\nfoo=1\n",
+                "incoming_path",
+                "/x"
+            ),
+            "[General]\nincoming_path=/x\nfoo=1\n"
+        );
+        assert_eq!(
+            set_ini("[General]\nfoo=1\n[Other]\na=b\n", "incoming_path", "/x"),
+            "[General]\nfoo=1\nincoming_path=/x\n[Other]\na=b\n"
+        );
+    }
 
     #[test]
     fn encodes_file_urls() {
