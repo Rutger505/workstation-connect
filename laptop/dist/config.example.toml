@@ -1,0 +1,11 @@
+# ~/.config/workstation-connect/config.toml
+
+# Phone's Bluetooth address: bluetoothctl devices
+phone = "AA:BB:CC:DD:EE:FF"
+# NetworkManager connection names (nmcli -f NAME,TYPE connection show)
+bt_connection = "Pixel 9 BT"
+hotspot_connection = "Pixel 9 hotspot"
+# Seconds without internet before the phone is asked
+offline_secs = 10
+# Saved Wi-Fi never worth leaving the hotspot for
+ignore_ssids = ["WiFi in de trein"]
