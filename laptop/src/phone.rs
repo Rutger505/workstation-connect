@@ -2,8 +2,8 @@
 
 use crate::proto::{self, Cmd, PhoneState};
 use anyhow::{Context, Result, anyhow, bail};
-use bluer::gatt::remote::{Characteristic, CharacteristicWriteRequest};
 use bluer::gatt::WriteOp;
+use bluer::gatt::remote::{Characteristic, CharacteristicWriteRequest};
 use bluer::{Adapter, Address, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport};
 use futures::{StreamExt, pin_mut};
 use serde::Serialize;
@@ -46,14 +46,21 @@ impl Phone {
     /// Write a command; fails if the phone isn't connected within `wait`.
     pub async fn send(&self, cmd: Cmd, wait: Duration) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.cmds.send((cmd, tx)).await.map_err(|_| anyhow!("phone task gone"))?;
-        timeout(wait, rx).await.with_context(|| format!("{cmd:?}: phone not reachable"))??
+        self.cmds
+            .send((cmd, tx))
+            .await
+            .map_err(|_| anyhow!("phone task gone"))?;
+        timeout(wait, rx)
+            .await
+            .with_context(|| format!("{cmd:?}: phone not reachable"))??
     }
 
     /// Wait until the phone reports a state matching `f`.
     pub async fn wait_for(&self, wait: Duration, f: impl Fn(&PhoneState) -> bool) -> bool {
         let mut rx = self.link.clone();
-        timeout(wait, rx.wait_for(|l| l.state.as_ref().is_some_and(&f))).await.is_ok_and(|r| r.is_ok())
+        timeout(wait, rx.wait_for(|l| l.state.as_ref().is_some_and(&f)))
+            .await
+            .is_ok_and(|r| r.is_ok())
     }
 }
 
@@ -99,7 +106,9 @@ async fn connect_and_serve(
     if !device.is_connected().await? || !device.is_services_resolved().await? {
         wait_for_advert(adapter, addr).await?;
         prefer_le(adapter.name(), addr).await;
-        timeout(Duration::from_secs(20), device.connect()).await.context("connect timed out")??;
+        timeout(Duration::from_secs(20), device.connect())
+            .await
+            .context("connect timed out")??;
     }
     timeout(Duration::from_secs(15), async {
         while !device.is_services_resolved().await? {
@@ -112,7 +121,10 @@ async fn connect_and_serve(
 
     let (control, state) = find_chars(&device).await?;
     let initial = state.read().await.context("read state (bonded over LE?)")?;
-    link.send_replace(Link { connected: true, state: PhoneState::parse(&initial) });
+    link.send_replace(Link {
+        connected: true,
+        state: PhoneState::parse(&initial),
+    });
     info!("phone connected: {:?}", link.borrow().state);
 
     let notify = state.notify().await.context("subscribe state")?;
@@ -173,7 +185,10 @@ async fn wait_for_advert(adapter: &Adapter, addr: Address) -> Result<()> {
 
 /// BlueZ >= 5.77: make Device1.Connect pick LE for this dual-mode phone. Best effort.
 async fn prefer_le(adapter: &str, addr: Address) {
-    let path = format!("/org/bluez/{adapter}/dev_{}", addr.to_string().replace(':', "_"));
+    let path = format!(
+        "/org/bluez/{adapter}/dev_{}",
+        addr.to_string().replace(':', "_")
+    );
     let res: zbus::Result<()> = async {
         let bus = zbus::Connection::system().await?;
         let props = zbus::fdo::PropertiesProxy::builder(&bus)
@@ -204,7 +219,10 @@ async fn find_chars(device: &bluer::Device) -> Result<(Characteristic, Character
                 _ => {}
             }
         }
-        return Ok((control.context("no control characteristic")?, state.context("no state characteristic")?));
+        return Ok((
+            control.context("no control characteristic")?,
+            state.context("no state characteristic")?,
+        ));
     }
     bail!("workstation-connect service not found on phone (app outdated or service stopped?)")
 }

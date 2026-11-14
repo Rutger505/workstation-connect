@@ -1,6 +1,8 @@
+mod actions;
 mod config;
 mod ctl;
 mod daemon;
+mod kde;
 mod logic;
 mod net;
 mod phone;
@@ -31,6 +33,18 @@ enum Command {
     Toggle,
     /// Waybar custom module (exec, return-type json).
     Waybar,
+    /// Action menu (walker/fuzzel/wofi/rofi).
+    Menu,
+    /// Ring the phone.
+    Ring,
+    /// Send the laptop clipboard to the phone.
+    Clip,
+    /// Send files to the phone (file picker without arguments).
+    Send { files: Vec<std::path::PathBuf> },
+    /// Mount the phone's storage (sftp) and open it.
+    Browse,
+    /// Phone screen in a window (scrcpy over wireless debugging).
+    Screen,
 }
 
 #[tokio::main]
@@ -40,13 +54,20 @@ async fn main() -> Result<()> {
         Command::Daemon => {
             tracing_subscriber::fmt()
                 .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "wsconnect=info".into()),
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "wsconnect=info".into()),
                 )
                 .without_time() // journald adds timestamps
                 .init();
             daemon::run(config::Config::load()?).await
         }
         Command::Waybar => ctl::waybar().await,
+        Command::Menu => actions::menu().await,
+        Command::Ring => actions::run(actions::Action::Ring, vec![]).await,
+        Command::Clip => actions::run(actions::Action::Clipboard, vec![]).await,
+        Command::Send { files } => actions::run(actions::Action::SendFiles, files).await,
+        Command::Browse => actions::run(actions::Action::Browse, vec![]).await,
+        Command::Screen => actions::run(actions::Action::Screen, vec![]).await,
         cmd => {
             let req = match cmd {
                 Command::Pause => "pause",

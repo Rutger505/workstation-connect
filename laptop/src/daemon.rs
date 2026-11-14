@@ -84,7 +84,10 @@ impl Ctx {
     }
 
     fn on_phone(&self) -> bool {
-        matches!(self.status.borrow().mode, Mode::Activating | Mode::Bluetooth | Mode::Hotspot)
+        matches!(
+            self.status.borrow().mode,
+            Mode::Activating | Mode::Bluetooth | Mode::Hotspot
+        )
     }
 }
 
@@ -106,9 +109,18 @@ fn check(ctx: &Ctx, epoch: u64) -> Result<()> {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
-    let addr = cfg.phone.parse().with_context(|| format!("phone address {:?}", cfg.phone))?;
+    let addr = cfg
+        .phone
+        .parse()
+        .with_context(|| format!("phone address {:?}", cfg.phone))?;
     let phone = Phone::spawn(addr);
-    let (status, _) = watch::channel(Status { mode: Mode::Idle, paused: false, phone: Link::default(), offline_secs: None, error: None });
+    let (status, _) = watch::channel(Status {
+        mode: Mode::Idle,
+        paused: false,
+        phone: Link::default(),
+        offline_secs: None,
+        error: None,
+    });
     let ctx = Arc::new(Ctx {
         cfg,
         nm: Nm::new().await?,
@@ -159,7 +171,10 @@ async fn idle(ctx: &Ctx) {
     let threshold = Duration::from_secs(ctx.cfg.offline_secs);
     loop {
         if *ctx.paused.borrow() {
-            ctx.set(|s| { s.mode = Mode::Paused; s.offline_secs = None; });
+            ctx.set(|s| {
+                s.mode = Mode::Paused;
+                s.offline_secs = None;
+            });
             let _ = ctx.paused.subscribe().wait_for(|p| !p).await;
             timer.reset();
         }
@@ -182,9 +197,15 @@ async fn idle(ctx: &Ctx) {
         let trigger = timer.update(snap.online, snap.connecting, now, threshold);
         let offline = timer.offline_for(now).map(|d| d.as_secs());
         ctx.set(|s| {
-            s.mode = if snap.online { Mode::Idle } else { Mode::Offline };
+            s.mode = if snap.online {
+                Mode::Idle
+            } else {
+                Mode::Offline
+            };
             s.offline_secs = offline;
-            if snap.online { s.error = None; }
+            if snap.online {
+                s.error = None;
+            }
         });
         if !trigger {
             continue;
@@ -192,7 +213,9 @@ async fn idle(ctx: &Ctx) {
         let link = ctx.phone.link();
         match link.state {
             Some(st) if link.connected && st.shizuku => return,
-            Some(_) if link.connected => ctx.error("phone: Shizuku not running (start it via wireless debugging)"),
+            Some(_) if link.connected => {
+                ctx.error("phone: Shizuku not running (start it via wireless debugging)")
+            }
             _ => ctx.set(|s| s.error = Some("phone not in reach over Bluetooth".into())),
         }
     }
@@ -201,10 +224,18 @@ async fn idle(ctx: &Ctx) {
 async fn activate(ctx: &Ctx, epoch: u64) -> Result<()> {
     let snap = ctx.nm.snapshot().await?;
     if snap.is_active(&ctx.cfg.hotspot_connection) || snap.is_active(&ctx.cfg.bt_connection) {
-        ctx.mode(if snap.is_active(&ctx.cfg.hotspot_connection) { Mode::Hotspot } else { Mode::Bluetooth });
+        ctx.mode(if snap.is_active(&ctx.cfg.hotspot_connection) {
+            Mode::Hotspot
+        } else {
+            Mode::Bluetooth
+        });
         return Ok(());
     }
-    ctx.set(|s| { s.mode = Mode::Activating; s.offline_secs = None; s.error = None; });
+    ctx.set(|s| {
+        s.mode = Mode::Activating;
+        s.offline_secs = None;
+        s.error = None;
+    });
     info!("offline: asking the phone");
     drop_dead_wifi(&snap).await;
     ctx.phone.send(Cmd::On, Duration::from_secs(10)).await?;
@@ -212,12 +243,22 @@ async fn activate(ctx: &Ctx, epoch: u64) -> Result<()> {
 
     // Bluetooth first: internet within seconds.
     let mut bt = false;
-    if ctx.phone.wait_for(Duration::from_secs(15), |s| s.bt_tether).await {
+    if ctx
+        .phone
+        .wait_for(Duration::from_secs(15), |s| s.bt_tether)
+        .await
+    {
         for _ in 0..3 {
             check(ctx, epoch)?;
             match net::up(&ctx.cfg.bt_connection, 15).await {
-                Ok(()) => { bt = true; break; }
-                Err(e) => { warn!("bt up: {e:#}"); sleep(Duration::from_secs(2)).await; }
+                Ok(()) => {
+                    bt = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!("bt up: {e:#}");
+                    sleep(Duration::from_secs(2)).await;
+                }
             }
         }
     } else {
@@ -256,7 +297,9 @@ async fn drop_dead_wifi(snap: &Snapshot) {
 
 async fn try_hotspot(ctx: &Ctx, epoch: u64, within: Duration) -> Result<bool> {
     let deadline = Instant::now() + within;
-    ctx.phone.wait_for(Duration::from_secs(20), |s| s.hotspot).await;
+    ctx.phone
+        .wait_for(Duration::from_secs(20), |s| s.hotspot)
+        .await;
     while Instant::now() < deadline {
         check(ctx, epoch)?;
         match net::up(&ctx.cfg.hotspot_connection, 15).await {
@@ -304,7 +347,11 @@ async fn on_phone(ctx: &Ctx, epoch: u64) -> Result<()> {
             let _ = ctx.phone.send(Cmd::Off, Duration::from_secs(5)).await;
             return Ok(()); // idle: asks again if still offline
         }
-        ctx.mode(if on_hotspot { Mode::Hotspot } else { Mode::Bluetooth });
+        ctx.mode(if on_hotspot {
+            Mode::Hotspot
+        } else {
+            Mode::Bluetooth
+        });
 
         if on_bt && !on_hotspot && last_hotspot_try.elapsed() >= Duration::from_secs(20) {
             if try_hotspot(ctx, epoch, Duration::from_secs(15)).await? {
@@ -363,7 +410,13 @@ async fn try_known_wifi(ctx: &Ctx, epoch: u64, id: &str) -> Result<bool> {
     default_path = "/org/freedesktop/login1"
 )]
 trait Login {
-    fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedFd>;
+    fn inhibit(
+        &self,
+        what: &str,
+        who: &str,
+        why: &str,
+        mode: &str,
+    ) -> zbus::Result<zbus::zvariant::OwnedFd>;
     #[zbus(signal)]
     fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
 }
@@ -374,7 +427,11 @@ async fn sleep_guard(ctx: Arc<Ctx>) {
         let bus = zbus::Connection::system().await?;
         let login = LoginProxy::new(&bus).await?;
         let mut signals = login.receive_prepare_for_sleep().await?;
-        let mut lock = Some(login.inhibit("sleep", "wsconnect", "turn the phone hotspot off", "delay").await?);
+        let mut lock = Some(
+            login
+                .inhibit("sleep", "wsconnect", "turn the phone hotspot off", "delay")
+                .await?,
+        );
         while let Some(sig) = signals.next().await {
             if sig.args()?.start {
                 if ctx.on_phone() {
@@ -386,7 +443,11 @@ async fn sleep_guard(ctx: Arc<Ctx>) {
                 }
                 lock = None; // release: suspend continues
             } else if lock.is_none() {
-                lock = Some(login.inhibit("sleep", "wsconnect", "turn the phone hotspot off", "delay").await?);
+                lock = Some(
+                    login
+                        .inhibit("sleep", "wsconnect", "turn the phone hotspot off", "delay")
+                        .await?,
+                );
             }
         }
         Ok(())
@@ -412,7 +473,9 @@ async fn serve_socket(ctx: Arc<Ctx>) {
         Err(e) => return ctx.error(format!("socket {}: {e}", path.display())),
     };
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
         let ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = client(ctx, stream).await {

@@ -69,11 +69,16 @@ pub struct Nm {
 
 impl Nm {
     pub async fn new() -> Result<Self> {
-        Ok(Self { bus: zbus::Connection::system().await.context("system bus")? })
+        Ok(Self {
+            bus: zbus::Connection::system().await.context("system bus")?,
+        })
     }
 
     async fn manager(&self) -> Result<NetworkManagerProxy<'_>> {
-        Ok(NetworkManagerProxy::builder(&self.bus).cache_properties(CacheProperties::No).build().await?)
+        Ok(NetworkManagerProxy::builder(&self.bus)
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?)
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot> {
@@ -87,10 +92,17 @@ impl Nm {
             active: Vec::new(),
         };
         for path in nm.active_connections().await? {
-            let Ok(builder) = ActiveConnectionProxy::builder(&self.bus).path(path) else { continue };
+            let Ok(builder) = ActiveConnectionProxy::builder(&self.bus).path(path) else {
+                continue;
+            };
             // Connections vanish between listing and reading; skip those.
-            let Ok(ac) = builder.cache_properties(CacheProperties::No).build().await else { continue };
-            let (Ok(id), Ok(kind), Ok(st)) = (ac.id().await, ac.kind().await, ac.state().await) else { continue };
+            let Ok(ac) = builder.cache_properties(CacheProperties::No).build().await else {
+                continue;
+            };
+            let (Ok(id), Ok(kind), Ok(st)) = (ac.id().await, ac.kind().await, ac.state().await)
+            else {
+                continue;
+            };
             snap.connecting |= st == ACTIVE_ACTIVATING;
             snap.active.push(ActiveConn { id, kind });
         }
@@ -106,18 +118,29 @@ impl Nm {
 }
 
 async fn nmcli(args: &[&str], timeout: Duration) -> Result<String> {
-    let out = tokio::time::timeout(timeout, Command::new("nmcli").args(args).kill_on_drop(true).output())
-        .await
-        .with_context(|| format!("nmcli {} timed out", args.join(" ")))??;
+    let out = tokio::time::timeout(
+        timeout,
+        Command::new("nmcli").args(args).kill_on_drop(true).output(),
+    )
+    .await
+    .with_context(|| format!("nmcli {} timed out", args.join(" ")))??;
     if !out.status.success() {
-        bail!("nmcli {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "nmcli {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 pub async fn up(id: &str, wait_secs: u64) -> Result<()> {
     let wait = wait_secs.to_string();
-    nmcli(&["--wait", &wait, "connection", "up", "id", id], Duration::from_secs(wait_secs + 5)).await?;
+    nmcli(
+        &["--wait", &wait, "connection", "up", "id", id],
+        Duration::from_secs(wait_secs + 5),
+    )
+    .await?;
     Ok(())
 }
 
@@ -131,17 +154,47 @@ pub async fn down(id: &str) -> Result<()> {
 }
 
 /// A saved Wi-Fi connection (not excluded) whose SSID is in range with decent signal.
-pub async fn known_wifi_in_range(exclude_ids: &[&str], exclude_ssids: &[String]) -> Result<Option<String>> {
+pub async fn known_wifi_in_range(
+    exclude_ids: &[&str],
+    exclude_ssids: &[String],
+) -> Result<Option<String>> {
     let t = Duration::from_secs(20);
     let mut saved = Vec::new();
-    for line in nmcli(&["-t", "-f", "NAME,TYPE", "connection", "show"], t).await?.lines() {
+    for line in nmcli(&["-t", "-f", "NAME,TYPE", "connection", "show"], t)
+        .await?
+        .lines()
+    {
         let f = split_terse(line);
         if f.len() == 2 && f[1] == "802-11-wireless" && !exclude_ids.contains(&f[0].as_str()) {
-            let ssid = nmcli(&["-g", "802-11-wireless.ssid", "connection", "show", "id", &f[0]], t).await?;
+            let ssid = nmcli(
+                &[
+                    "-g",
+                    "802-11-wireless.ssid",
+                    "connection",
+                    "show",
+                    "id",
+                    &f[0],
+                ],
+                t,
+            )
+            .await?;
             saved.push((f[0].clone(), ssid.trim().to_string()));
         }
     }
-    let scan = nmcli(&["-t", "-f", "SSID,SIGNAL", "device", "wifi", "list", "--rescan", "yes"], t).await?;
+    let scan = nmcli(
+        &[
+            "-t",
+            "-f",
+            "SSID,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "--rescan",
+            "yes",
+        ],
+        t,
+    )
+    .await?;
     Ok(pick_known(&saved, &scan, exclude_ssids))
 }
 
@@ -159,7 +212,11 @@ fn pick_known(saved: &[(String, String)], scan: &str, exclude_ssids: &[String]) 
         .iter()
         .filter(|(_, ssid)| !ssid.is_empty() && !exclude_ssids.contains(ssid))
         .filter_map(|(id, ssid)| {
-            let best = visible.iter().filter(|(s, _)| s == ssid).map(|(_, sig)| *sig).max()?;
+            let best = visible
+                .iter()
+                .filter(|(s, _)| s == ssid)
+                .map(|(_, sig)| *sig)
+                .max()?;
             (best >= MIN_SIGNAL).then_some((id.clone(), best))
         })
         .max_by_key(|(_, sig)| *sig)
@@ -186,7 +243,10 @@ mod tests {
 
     #[test]
     fn splits_escaped_fields() {
-        assert_eq!(split_terse(r"my\:wifi:802-11-wireless"), ["my:wifi", "802-11-wireless"]);
+        assert_eq!(
+            split_terse(r"my\:wifi:802-11-wireless"),
+            ["my:wifi", "802-11-wireless"]
+        );
         assert_eq!(split_terse(r"a\\b:"), ["a\\b", ""]);
     }
 
@@ -198,7 +258,10 @@ mod tests {
             ("Train".to_string(), "WiFi in de trein".to_string()),
         ];
         let scan = "home:30\neduroam:70\nWiFi in de trein:90\nother:99\n";
-        assert_eq!(pick_known(&saved, scan, &["WiFi in de trein".into()]), Some("eduroam".into()));
+        assert_eq!(
+            pick_known(&saved, scan, &["WiFi in de trein".into()]),
+            Some("eduroam".into())
+        );
         assert_eq!(pick_known(&saved, "home:20\n", &[]), None);
     }
 }

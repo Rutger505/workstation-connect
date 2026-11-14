@@ -9,3 +9,7 @@ hotspot_connection = "Pixel 9 hotspot"
 offline_secs = 10
 # Saved Wi-Fi never worth leaving the hotspot for
 ignore_ssids = ["WiFi in de trein"]
+# KDE Connect device id or name of the phone (default: first paired smartphone)
+# kdeconnect_device = "Pixel 9"
+# Menu for `wsconnect menu` (default: walker/fuzzel/wofi/rofi, first found)
+# menu = ["fuzzel", "--dmenu"]

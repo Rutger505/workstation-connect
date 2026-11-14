@@ -35,7 +35,9 @@ pub struct PhoneState {
 
 impl PhoneState {
     pub fn parse(b: &[u8]) -> Option<Self> {
-        let [flags, battery, signal, _version, ..] = *b else { return None };
+        let [flags, battery, signal, _version, ..] = *b else {
+            return None;
+        };
         Some(Self {
             shizuku: flags & FLAG_SHIZUKU != 0,
             bt_tether: flags & FLAG_BT_TETHER != 0,

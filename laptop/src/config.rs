@@ -18,6 +18,10 @@ pub struct Config {
     /// Saved Wi-Fi networks never worth leaving the hotspot for (train Wi-Fi with captive portal).
     #[serde(default)]
     pub ignore_ssids: Vec<String>,
+    /// KDE Connect device id or name of the phone. Default: first paired smartphone.
+    pub kdeconnect_device: Option<String>,
+    /// Menu command reading entries on stdin (dmenu mode). Default: walker/fuzzel/wofi/rofi, first found.
+    pub menu: Option<Vec<String>>,
 }
 
 fn default_offline_secs() -> u64 {
@@ -27,14 +31,17 @@ fn default_offline_secs() -> u64 {
 pub fn dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+        })
         .join("workstation-connect")
 }
 
 impl Config {
     pub fn load() -> Result<Self> {
         let path = dir().join("config.toml");
-        let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
     }
 }

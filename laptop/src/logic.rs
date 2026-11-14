@@ -13,7 +13,13 @@ pub struct OfflineTimer {
 
 impl OfflineTimer {
     /// Returns true when the phone should be asked for internet.
-    pub fn update(&mut self, online: bool, connecting: bool, now: Instant, threshold: Duration) -> bool {
+    pub fn update(
+        &mut self,
+        online: bool,
+        connecting: bool,
+        now: Instant,
+        threshold: Duration,
+    ) -> bool {
         if online {
             self.since = None;
             return false;

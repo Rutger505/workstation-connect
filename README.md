@@ -2,9 +2,12 @@
 
 Phone ↔ laptop link for a Pixel 9 and an Arch/Hyprland laptop.
 
-- `android/`: phone app. BLE GATT server in a foreground service; turns Bluetooth tethering and the
-  Wi-Fi hotspot on/off via Shizuku; reports battery, signal and tethering state.
-- `laptop/`: `wsconnect`, Rust daemon + CLI + waybar module.
+- Phone app: [Rutger505/workstation-connect-android](https://github.com/Rutger505/workstation-connect-android),
+  a KDE Connect Android fork (GPL) with its own home screen, auto hotspot (BLE GATT server +
+  Shizuku tethering) and a trackpad with volume keys as mouse buttons.
+- `laptop/`: `wsconnect`, Rust daemon (NetworkManager watch, BLE trigger) + CLI + waybar module +
+  action menu. Uses headless `kdeconnectd` over D-Bus as the engine for notifications, clipboard,
+  files and pairing.
 - `spike/`: phase 0 experiments (tethering via Shizuku, timing script).
 
 ## How it works
@@ -19,7 +22,7 @@ Phone ↔ laptop link for a Pixel 9 and an Arch/Hyprland laptop.
 6. Suspend or pause (waybar click): phone off. Laptop gone for 3 min (BLE lost): the phone turns
    itself off.
 
-BLE protocol (both sides: `Proto.kt`, `proto.rs`), service `6f2b0001-3c1d-4e8a-9f41-7a5d2c9e0b10`:
+BLE protocol (both sides: `Proto.kt` in the app, `proto.rs`), service `6f2b0001-3c1d-4e8a-9f41-7a5d2c9e0b10`:
 - `…0002` control, write, encrypted: `0` off, `1` on, `2` Bluetooth tethering off
 - `…0003` state, read/notify, encrypted: `[flags, battery %, signal 0-4|255, version]`,
   flags: 1 Shizuku ready, 2 BT tethered, 4 hotspot on, 8 wanted, 16 last command failed
@@ -28,12 +31,15 @@ BLE protocol (both sides: `Proto.kt`, `proto.rs`), service `6f2b0001-3c1d-4e8a-9
 
 **Phone**
 1. Install Shizuku (Play Store), start it via wireless debugging (again after every reboot).
-2. Install the app, tap **Rechten**, **Shizuku**, **Batterij**, then **Start**.
+2. Install the app ([APK](https://cdn.rutgerpronk.com/artifacts/workstation-connect/workstation-connect.apk)),
+   work through **Nog instellen**, pair the laptop, turn on **Internet delen → Automatisch**.
 3. Hotspot settings: note SSID + password.
 
 **Laptop**
 ```
-cargo install --path laptop
+sudo pacman -S kdeconnect   # engine; also: scrcpy android-tools zenity (optional actions)
+kdeconnectd &               # or autostart it (Hyprland: exec-once = kdeconnectd)
+cargo install --git https://github.com/Rutger505/workstation-connect wsconnect
 mkdir -p ~/.config/workstation-connect ~/.config/systemd/user
 cp laptop/dist/config.example.toml ~/.config/workstation-connect/config.toml   # edit
 cp laptop/dist/wsconnect.service ~/.config/systemd/user/
@@ -45,7 +51,7 @@ bluetoothctl pair <phone MAC> && bluetoothctl trust <phone MAC>
 nmcli connection add type bluetooth con-name "Pixel 9 BT" bluetooth.bdaddr <phone MAC> \
   bluetooth.type panu connection.autoconnect no
 
-# hotspot connection: turn the hotspot on by hand once (app: "Test aan"), then
+# hotspot connection: turn the hotspot on by hand once (app: "Nu aanzetten"), then
 nmcli device wifi connect "<SSID>" password "<password>" name "Pixel 9 hotspot"
 nmcli connection modify "Pixel 9 hotspot" connection.autoconnect no
 
@@ -58,25 +64,25 @@ journalctl --user -fu wsconnect
 "custom/phone": {
   "exec": "wsconnect waybar",
   "return-type": "json",
-  "on-click": "wsconnect toggle"
+  "on-click": "wsconnect toggle",
+  "on-click-right": "wsconnect menu"
 }
 ```
+Phone battery/signal come from BLE when in reach, else from KDE Connect.
 CSS classes: `idle`, `nophone`, `offline`, `activating`, `tethered`, `paused`, `down`.
 
-CLI: `wsconnect status | pause | resume | toggle`.
+CLI: `wsconnect status | pause | resume | toggle | menu | ring | clip | send [files] | browse | screen`.
+- `menu`: walker/fuzzel/wofi/rofi (dmenu mode), first found; override with `menu = [...]` in config.
+- `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,
+  else finds the phone via mDNS (same network). First time: `adb pair <ip:port> <code>`.
+- `browse`: mounts the phone over sftp (kdeconnectd) and opens it with xdg-open.
 
 ## Build
 
 ```
-# phone
-cd android
-export ANDROID_HOME=~/.local/share/android-sdk JAVA_HOME=/usr/lib/jvm/java-17-openjdk
-echo "sdk.dir=$ANDROID_HOME" > local.properties
-./gradlew assembleDebug --no-daemon
-
-# laptop
 cd laptop && cargo test && cargo build --release
 ```
+Phone: see `WSCONNECT.md` in the app repo.
 
 ## Phase 0 spike
 
