@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Phase 0 laptop side: time from "connect" to working internet, plus download speed, over one NM connection.
+# Usage: measure <nm-connection-name>   (e.g. the phone's hotspot SSID, or "Pixel 9 Network" for BT PAN)
+# List names: nmcli -f NAME,TYPE connection show
+set -euo pipefail
+conn=${1:?usage: measure <nm-connection-name>}
+now() { date +%s%3N; }
+
+nmcli connection down "$conn" >/dev/null 2>&1 || true
+t0=$(now)
+nmcli --wait 60 connection up "$conn" >/dev/null
+t1=$(now)
+dev=$(nmcli -g GENERAL.DEVICES connection show "$conn")
+until [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 --interface "$dev" http://connectivitycheck.gstatic.com/generate_204)" = 204 ]; do
+  [ $(( $(now) - t0 )) -gt 60000 ] && { echo "no internet via $dev after 60 s"; exit 1; }
+  sleep 0.2
+done
+t2=$(now)
+bps=$(curl -s -o /dev/null --max-time 30 --interface "$dev" -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=25000000')
+
+echo "connection:  $conn ($dev)"
+echo "link up:     $((t1 - t0)) ms"
+echo "internet:    $((t2 - t0)) ms"
+awk -v b="$bps" 'BEGIN { printf "download:    %.1f Mbps\n", b * 8 / 1e6 }'
