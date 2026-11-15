@@ -35,8 +35,6 @@ enum Command {
     Waybar,
     /// Action menu (walker/fuzzel/wofi/rofi).
     Menu,
-    /// Ring the phone.
-    Ring,
     /// Send the laptop clipboard to the phone.
     Clip,
     /// Send files to the phone (file picker without arguments).
@@ -65,7 +63,6 @@ async fn main() -> Result<()> {
         }
         Command::Waybar => ctl::waybar().await,
         Command::Menu => actions::menu().await,
-        Command::Ring => actions::run(actions::Action::Ring, vec![]).await,
         Command::Clip => actions::run(actions::Action::Clipboard, vec![]).await,
         Command::Send { files } => actions::run(actions::Action::SendFiles, files).await,
         Command::Browse => actions::run(actions::Action::Browse, vec![]).await,

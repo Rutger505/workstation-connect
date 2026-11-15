@@ -90,7 +90,7 @@ journalctl --user -fu wsconnect
 Phone battery/signal come from BLE when in reach, else from KDE Connect.
 CSS classes: `idle`, `nophone`, `offline`, `activating`, `tethered`, `paused`, `down`.
 
-CLI: `wsconnect status | pause | resume | toggle | menu | ring | clip | send [files] | browse | screen | setup`.
+CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
 - `menu`: walker/fuzzel/wofi/rofi (dmenu mode), first found; override with `menu = [...]` in config.
 - `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,

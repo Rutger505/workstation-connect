@@ -9,7 +9,6 @@ use tokio::process::Command;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
-    Ring,
     Clipboard,
     SendFiles,
     Browse,
@@ -18,12 +17,11 @@ pub enum Action {
 }
 
 impl Action {
-    pub const MENU: [Action; 6] = [
+    pub const MENU: [Action; 5] = [
         Action::SendFiles,
         Action::Clipboard,
         Action::Browse,
         Action::Screen,
-        Action::Ring,
         Action::Pause,
     ];
 
@@ -33,7 +31,6 @@ impl Action {
             Action::Clipboard => "󰅌  Send clipboard to phone",
             Action::Browse => "󰉋  Browse phone files",
             Action::Screen => "󰍹  Phone screen (scrcpy)",
-            Action::Ring => "󰂞  Ring phone",
             Action::Pause => "󰏤  Pause / resume auto hotspot",
         }
     }
@@ -55,7 +52,6 @@ pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
     let kde = Kde::connect().await?;
     let id = phone(&kde).await?;
     match action {
-        Action::Ring => kde.ring(&id).await,
         Action::Clipboard => kde.send_clipboard(&id).await,
         Action::SendFiles => {
             let files = if files.is_empty() {

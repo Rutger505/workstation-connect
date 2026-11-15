@@ -130,17 +130,6 @@ impl Kde {
         })
     }
 
-    pub async fn ring(&self, id: &str) -> Result<()> {
-        let p = self
-            .device(
-                id,
-                Some("findmyphone"),
-                "org.kde.kdeconnect.device.findmyphone",
-            )
-            .await?;
-        Ok(p.call("ring", &()).await?)
-    }
-
     pub async fn send_clipboard(&self, id: &str) -> Result<()> {
         let p = self
             .device(id, Some("clipboard"), "org.kde.kdeconnect.device.clipboard")
