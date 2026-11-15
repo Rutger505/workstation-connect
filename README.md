@@ -44,8 +44,14 @@ mkdir -p ~/.config/workstation-connect ~/.config/systemd/user
 cp laptop/dist/config.example.toml ~/.config/workstation-connect/config.toml   # edit
 cp laptop/dist/wsconnect.service ~/.config/systemd/user/
 
+# BlueZ >= 5.84: the daemon uses the LE bearer API (org.bluez.Bearer.LE1), which is experimental
+sudo sed -i 's/^#\?Experimental = .*/Experimental = true/' /etc/bluetooth/main.conf
+sudo systemctl restart bluetooth
+
 # pair once (phone: Settings → Connected devices → Pair new device)
 bluetoothctl pair <phone MAC> && bluetoothctl trust <phone MAC>
+# That bond is BR/EDR (tethering). The BLE link needs an LE bond too: the daemon pairs over LE by
+# itself on first start (journal shows a code, accept it on the phone).
 
 # Bluetooth tethering connection
 nmcli connection add type bluetooth con-name "Pixel 9 BT" bluetooth.bdaddr <phone MAC> \
