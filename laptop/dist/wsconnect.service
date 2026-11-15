@@ -3,7 +3,8 @@ Description=workstation-connect: phone internet on demand
 After=dbus.service
 
 [Service]
-ExecStart=%h/.cargo/bin/wsconnect daemon
+# env resolves via the user manager PATH (environment.d), so any CARGO_HOME works
+ExecStart=/usr/bin/env wsconnect daemon
 Restart=always
 RestartSec=5
 
