@@ -38,7 +38,7 @@ BLE protocol (both sides: `Proto.kt` in the app, `proto.rs`), service `6f2b0001-
 **Laptop**
 ```
 sudo pacman -S kdeconnect   # engine; also: scrcpy android-tools zenity (optional actions)
-kdeconnectd &               # or autostart it (Hyprland: exec-once = kdeconnectd)
+systemctl --user start app-org.kde.kdeconnect.daemon@autostart.service   # not a bare kdeconnectd, see trackpad
 cargo install --git https://github.com/Rutger505/workstation-connect wsconnect
 mkdir -p ~/.config/workstation-connect ~/.config/systemd/user
 cp laptop/dist/config.example.toml ~/.config/workstation-connect/config.toml   # edit
@@ -60,6 +60,18 @@ nmcli connection add type bluetooth con-name "Pixel 9 BT" bluetooth.bdaddr <phon
 # hotspot connection: turn the hotspot on by hand once (app: "Nu aanzetten"), then
 nmcli device wifi connect "<SSID>" password "<password>" name "Pixel 9 hotspot"
 nmcli connection modify "Pixel 9 hotspot" connection.autoconnect no
+
+# trackpad: kdeconnectd injects input via the RemoteDesktop portal, which xdg-desktop-portal-hyprland
+# lacks. Route it to luminous and whitelist only KDE Connect, so it skips luminous' permission
+# dialog. First use asks once which screen the cursor lives on.
+sudo pacman -S xdg-desktop-portal-luminous   # chaotic-aur
+mkdir -p ~/.config/xdg-desktop-portal ~/.config/xdg-desktop-portal-luminous ~/.local/share/dbus-1/services
+printf '[preferred]\ndefault=hyprland;gtk\norg.freedesktop.impl.portal.RemoteDesktop=luminous\n' \
+  > ~/.config/xdg-desktop-portal/hyprland-portals.conf
+echo '{"remote": ["org.kde.kdeconnect.daemon"]}' > ~/.config/xdg-desktop-portal-luminous/whitelist.json
+# start kdeconnectd in its app unit so the portal knows its app ID, also when D-Bus activates it
+printf '[D-BUS Service]\nName=org.kde.kdeconnect\nExec=/usr/bin/kdeconnectd\nSystemdService=app-org.kde.kdeconnect.daemon@autostart.service\n' \
+  > ~/.local/share/dbus-1/services/org.kde.kdeconnect.service
 
 wsconnect setup   # once, after pairing in the app: laptop notifications → phone, Bluetooth link, share_dir
 systemctl --user enable --now wsconnect
