@@ -103,23 +103,39 @@ async fn connect_and_serve(
     if !device.is_paired().await.unwrap_or(false) {
         bail!("{addr} is not paired: bluetoothctl pair {addr} && bluetoothctl trust {addr}");
     }
-    if !device.is_connected().await? || !device.is_services_resolved().await? {
+    // Connected/ServicesResolved also cover BR/EDR (KDE Connect's Bluetooth link keeps an RFCOMM
+    // link up), which never shows our GATT service: check the LE bearer itself.
+    let le = LeBearer::new(adapter.name(), addr).await;
+    let le_up = match &le {
+        Some(b) => b.connected().await.unwrap_or(false),
+        None => device.is_connected().await? && device.is_services_resolved().await?,
+    };
+    if !le_up {
         wait_for_advert(adapter, addr).await?;
         prefer_le(adapter.name(), addr).await;
-        timeout(Duration::from_secs(20), device.connect())
+        let connect = async {
+            match &le {
+                Some(b) => b.connect().await,
+                None => Ok(device.connect().await?),
+            }
+        };
+        timeout(Duration::from_secs(20), connect)
             .await
             .context("connect timed out")??;
     }
-    timeout(Duration::from_secs(15), async {
-        while !device.is_services_resolved().await? {
-            sleep(Duration::from_millis(250)).await;
+    // ServicesResolved may already be true from BR/EDR: wait for our service itself.
+    let (control, state) = timeout(Duration::from_secs(15), async {
+        loop {
+            match find_chars(&device).await {
+                Ok(c) => return Ok(c),
+                Err(e) if e.is::<NotFound>() => sleep(Duration::from_millis(500)).await,
+                Err(e) => return Err(e),
+            }
         }
-        Ok::<_, bluer::Error>(())
     })
     .await
-    .context("GATT services not resolved")??;
+    .map_err(|_| anyhow!(NotFound))??;
 
-    let (control, state) = find_chars(&device).await?;
     let initial = state.read().await.context("read state (bonded over LE?)")?;
     link.send_replace(Link {
         connected: true,
@@ -130,8 +146,15 @@ async fn connect_and_serve(
     let notify = state.notify().await.context("subscribe state")?;
     let events = device.events().await?;
     pin_mut!(notify, events);
+    let mut le_check = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
+            _ = le_check.tick() => {
+                // Device-level Connected stays true while BR/EDR is up; the LE link is what we use.
+                if let Some(b) = &le && !b.connected().await.unwrap_or(true) {
+                    bail!("LE link lost");
+                }
+            }
             v = notify.next() => {
                 let v = v.ok_or_else(|| anyhow!("notifications ended"))?;
                 link.send_modify(|l| l.state = PhoneState::parse(&v).or(l.state));
@@ -224,5 +247,57 @@ async fn find_chars(device: &bluer::Device) -> Result<(Characteristic, Character
             state.context("no state characteristic")?,
         ));
     }
-    bail!("workstation-connect service not found on phone (app outdated or service stopped?)")
+    Err(NotFound.into())
+}
+
+#[derive(Debug)]
+struct NotFound;
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("workstation-connect service not found on phone over LE (app outdated or service stopped?)")
+    }
+}
+
+impl std::error::Error for NotFound {}
+
+/// BlueZ >= 5.83 org.bluez.Bearer.LE1: LE link state/connect separate from BR/EDR. None on older BlueZ.
+struct LeBearer(zbus::Proxy<'static>);
+
+impl LeBearer {
+    async fn new(adapter: &str, addr: Address) -> Option<Self> {
+        let path = format!(
+            "/org/bluez/{adapter}/dev_{}",
+            addr.to_string().replace(':', "_")
+        );
+        let res: zbus::Result<zbus::Proxy<'static>> = async {
+            let bus = zbus::Connection::system().await?;
+            zbus::proxy::Builder::new(&bus)
+                .destination("org.bluez")?
+                .path(path)?
+                .interface("org.bluez.Bearer.LE1")?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await
+        }
+        .await;
+        let b = Self(res.ok()?);
+        b.connected().await.ok()?; // interface missing → old BlueZ
+        Some(b)
+    }
+
+    async fn connected(&self) -> zbus::Result<bool> {
+        self.0.get_property("Connected").await
+    }
+
+    async fn connect(&self) -> Result<()> {
+        match self.0.call::<_, _, ()>("Connect", &()).await {
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.bluez.Error.AlreadyConnected" =>
+            {
+                Ok(())
+            }
+            r => Ok(r.context("LE connect")?),
+        }
+    }
 }
