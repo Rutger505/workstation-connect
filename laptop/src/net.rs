@@ -19,6 +19,8 @@ trait NetworkManager {
     fn state(&self) -> zbus::Result<u32>;
     #[zbus(property)]
     fn active_connections(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+    #[zbus(property)]
+    fn primary_connection(&self) -> zbus::Result<OwnedObjectPath>;
     fn check_connectivity(&self) -> zbus::Result<u32>;
     fn get_devices(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
 }
@@ -121,6 +123,20 @@ impl Nm {
             snap.active.push(ActiveConn { id, kind });
         }
         Ok(snap)
+    }
+
+    /// Fires on every (re)connect: primary connection changed or connectivity became full.
+    /// Includes the initial values once.
+    pub async fn reconnects(&self) -> Result<impl Stream<Item = ()> + '_> {
+        let nm = NetworkManagerProxy::new(&self.bus).await?;
+        let primary = nm.receive_primary_connection_changed().await.map(|_| ());
+        let full = nm
+            .receive_connectivity_changed()
+            .await
+            .filter_map(
+                |c| async move { (c.get().await.ok()? == CONNECTIVITY_FULL).then_some(()) },
+            );
+        Ok(futures::stream::select(primary, full))
     }
 
     /// The Wi-Fi device's active connection as `(object path, id)`, now and on every change.

@@ -91,7 +91,7 @@ journalctl --user -fu wsconnect
 ```
 Phone battery/signal come from BLE when in reach, else from KDE Connect.
 CSS classes: `idle`, `nophone`, `offline`, `activating`, `tethered`, `paused`, `down`.
-Outdated install (GitHub main has newer `laptop/` commits; daemon checks every 6 h): text gets `󰚰`,
+Outdated install (GitHub main has newer `laptop/` commits; daemon checks every 15 min and on every network reconnect): text gets `󰚰`,
 tooltip shows `installed → latest`, class becomes `["<class>", "outdated"]`, menu gets
 **Update wsconnect**.
 

@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 pub const COMMIT: &str = env!("WSCONNECT_COMMIT");
@@ -20,10 +21,13 @@ pub const VERSION: &str = concat!(
 const REPO: &str = "Rutger505/workstation-connect";
 const GIT_URL: &str = "https://github.com/Rutger505/workstation-connect";
 const FIRST_CHECK: Duration = Duration::from_secs(30);
-const EVERY: Duration = Duration::from_secs(6 * 3600);
-const RETRY: Duration = Duration::from_secs(30 * 60);
+const EVERY: Duration = Duration::from_secs(15 * 60);
+const RETRY: Duration = Duration::from_secs(5 * 60);
 /// Wake-up granularity: monotonic sleeps stop during suspend, wall clock doesn't.
-const TICK: Duration = Duration::from_secs(10 * 60);
+const TICK: Duration = Duration::from_secs(60);
+
+/// Settle time after a (re)connect before checking: DNS/route and NM's own connectivity check.
+const AFTER_RECONNECT: Duration = Duration::from_secs(10);
 
 /// Set in the daemon status only when outdated.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -89,8 +93,9 @@ fn check_blocking(installed: &str) -> Result<Option<Update>> {
 }
 
 /// Daemon task: reports Some(update) / None on every successful check. Errors keep the old
-/// result. Never runs for builds without a known commit.
-pub async fn watch(report: impl Fn(Option<Update>)) {
+/// result. Never runs for builds without a known commit. `reconnected` = check now (after a
+/// short settle), on top of the fixed interval.
+pub async fn watch(report: impl Fn(Option<Update>), reconnected: &Notify) {
     if COMMIT == "unknown" {
         info!("update check off: build commit unknown");
         return;
@@ -117,7 +122,17 @@ pub async fn watch(report: impl Fn(Option<Update>)) {
         };
         let next = SystemTime::now() + wait;
         while SystemTime::now() < next {
-            tokio::time::sleep(TICK.min(wait)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(TICK.min(wait)) => {}
+                _ = reconnected.notified() => {
+                    // Connect events come in bursts (primary + connectivity): settle, then drop
+                    // the stored permit so the burst gives one check.
+                    tokio::time::sleep(AFTER_RECONNECT).await;
+                    let _ = tokio::time::timeout(Duration::ZERO, reconnected.notified()).await;
+                    debug!("network (re)connected: checking for updates");
+                    break;
+                }
+            }
         }
     }
 }

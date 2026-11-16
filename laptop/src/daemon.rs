@@ -146,7 +146,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
     });
     let c = ctx.clone();
-    tokio::spawn(async move { crate::update::watch(|u| c.set(|s| s.update = u)).await });
+    let reconnected = Arc::new(tokio::sync::Notify::new());
+    let r = reconnected.clone();
+    tokio::spawn(async move { crate::update::watch(|u| c.set(|s| s.update = u), &r).await });
+    tokio::spawn(reconnect_watch(ctx.clone(), reconnected));
     tokio::spawn(sleep_guard(ctx.clone()));
     tokio::spawn(wifi_guard(ctx.clone()));
     tokio::spawn(serve_socket(ctx.clone()));
@@ -408,6 +411,29 @@ async fn try_known_wifi(ctx: &Ctx, epoch: u64, id: &str) -> Result<bool> {
         warn!("hotspot back up: {e:#}");
     }
     Ok(false)
+}
+
+/// Pokes the update check on every network (re)connect.
+async fn reconnect_watch(ctx: Arc<Ctx>, reconnected: Arc<tokio::sync::Notify>) {
+    loop {
+        let res: Result<()> = async {
+            let events = ctx.nm.reconnects().await?;
+            pin_mut!(events);
+            // Each property stream starts with its current value: the startup check covers those.
+            let start = std::time::Instant::now();
+            while events.next().await.is_some() {
+                if start.elapsed() > Duration::from_secs(5) {
+                    reconnected.notify_one();
+                }
+            }
+            bail!("NM watch ended")
+        }
+        .await;
+        if let Err(e) = res {
+            warn!("reconnect watch: {e:#}");
+        }
+        sleep(Duration::from_secs(30)).await;
+    }
 }
 
 /// The phone's KDE Connect keeps a dead TCP link "connected" for ~15 min after the laptop leaves
