@@ -89,13 +89,19 @@ journalctl --user -fu wsconnect
 ```
 Phone battery/signal come from BLE when in reach, else from KDE Connect.
 CSS classes: `idle`, `nophone`, `offline`, `activating`, `tethered`, `paused`, `down`.
+Outdated install (GitHub main has newer `laptop/` commits; daemon checks every 6 h): text gets `󰚰`,
+tooltip shows `installed → latest`, class becomes `["<class>", "outdated"]`, menu gets
+**Update wsconnect**.
 
-CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup`.
+CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
 - `menu`: walker/fuzzel/wofi/rofi (dmenu mode), first found; override with `menu = [...]` in config.
 - `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,
   else finds the phone via mDNS (same network). First time: `adb pair <ip:port> <code>`.
 - `browse`: mounts the phone over sftp (kdeconnectd) and opens it with xdg-open.
+- `update`: `cargo install --git … --force --locked`, then restarts the daemon if active. Menu runs it
+  via `xdg-terminal-exec`, else `$TERMINAL -e`. `--version` shows the build commit (`unknown`
+  without git: no update check).
 
 ## Build
 
