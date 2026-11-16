@@ -101,7 +101,7 @@ CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | 
 - `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,
   else finds the phone via mDNS (same network). First time: `adb pair <ip:port> <code>`.
 - `browse`: mounts the phone over sftp (kdeconnectd) and opens it with xdg-open.
-- `update`: `cargo install --git … --force --locked`, then restarts the daemon if active. Menu runs it
+- `update`: `cargo install --git … --force --locked --target-dir ~/.cache/wsconnect/target` (kept build cache: only changed crates recompile), then restarts the daemon if active. Menu runs it
   via `xdg-terminal-exec`, else `$TERMINAL -e`. `--version` shows the build commit (`unknown`
   without git: no update check).
 

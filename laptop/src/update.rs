@@ -152,6 +152,17 @@ pub async fn run(pause: bool) -> Result<()> {
     r
 }
 
+/// Persistent build dir: `cargo install` otherwise builds in a temp dir and recompiles every
+/// dependency on each update. Safe to delete (next update is a full build again).
+fn target_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")
+        })
+        .join("wsconnect/target")
+}
+
 async fn install() -> Result<()> {
     let status = Command::new("cargo")
         .args([
@@ -161,7 +172,9 @@ async fn install() -> Result<()> {
             "wsconnect",
             "--force",
             "--locked",
+            "--target-dir",
         ])
+        .arg(target_dir())
         .status()
         .await
         .context("start cargo")?;
