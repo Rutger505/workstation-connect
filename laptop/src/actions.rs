@@ -14,6 +14,8 @@ pub enum Action {
     Browse,
     Screen,
     Pause,
+    /// Only in the menu while the daemon reports an update.
+    Update,
 }
 
 impl Action {
@@ -32,6 +34,7 @@ impl Action {
             Action::Browse => "󰉋  Browse phone files",
             Action::Screen => "󰍹  Phone screen (scrcpy)",
             Action::Pause => "󰏤  Pause / resume auto hotspot",
+            Action::Update => "󰚰  Update wsconnect",
         }
     }
 }
@@ -48,6 +51,9 @@ pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
     }
     if action == Action::Screen {
         return screen().await;
+    }
+    if action == Action::Update {
+        return update_in_terminal();
     }
     let kde = Kde::connect().await?;
     let id = phone(&kde).await?;
@@ -76,7 +82,7 @@ pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
                 .context("xdg-open")?;
             Ok(())
         }
-        Action::Screen | Action::Pause => unreachable!(),
+        Action::Screen | Action::Pause | Action::Update => unreachable!(),
     }
 }
 
@@ -151,7 +157,16 @@ pub async fn menu() -> Result<()> {
         .stdout(Stdio::piped())
         .spawn()
         .with_context(|| format!("start {}", cmd[0]))?;
-    let input = Action::MENU
+    let outdated = crate::ctl::request("status")
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .is_some_and(|v| v["update"].is_object());
+    let mut actions = Action::MENU.to_vec();
+    if outdated {
+        actions.push(Action::Update);
+    }
+    let input = actions
         .iter()
         .map(|a| a.label())
         .collect::<Vec<_>>()
@@ -161,10 +176,28 @@ pub async fn menu() -> Result<()> {
     drop(stdin);
     let out = child.wait_with_output().await?;
     let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    match Action::MENU.into_iter().find(|a| a.label() == picked) {
+    match actions.into_iter().find(|a| a.label() == picked) {
         Some(a) => run(a, vec![]).await,
         None => Ok(()), // cancelled
     }
+}
+
+/// `wsconnect update` in a terminal: xdg-terminal-exec, else $TERMINAL -e.
+fn update_in_terminal() -> Result<()> {
+    let args = ["wsconnect", "update", "--pause"];
+    let mut cmd = if which("xdg-terminal-exec") {
+        std::process::Command::new("xdg-terminal-exec")
+    } else {
+        let term = std::env::var("TERMINAL")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .context("no terminal: install xdg-terminal-exec or set $TERMINAL")?;
+        let mut c = std::process::Command::new(term);
+        c.arg("-e");
+        c
+    };
+    cmd.args(args).spawn().context("start terminal")?;
+    Ok(())
 }
 
 fn which(bin: &str) -> bool {
@@ -276,7 +309,9 @@ mod tests {
     #[test]
     fn menu_labels_unique() {
         let mut l: Vec<_> = Action::MENU.iter().map(|a| a.label()).collect();
+        l.push(Action::Update.label());
+        l.sort();
         l.dedup();
-        assert_eq!(l.len(), Action::MENU.len());
+        assert_eq!(l.len(), Action::MENU.len() + 1);
     }
 }

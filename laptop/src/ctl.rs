@@ -153,6 +153,16 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if let Some(s) = signal {
         text.push_str(&format!(" {}", BARS[s.clamp(0, 4) as usize]));
     }
+    let update = daemon
+        .map(|v| &v["update"])
+        .filter(|u| u.is_object())
+        .map(|u| {
+            let f = |k: &str| u[k].as_str().unwrap_or("?").to_string();
+            (f("installed"), f("latest"))
+        });
+    if update.is_some() {
+        text.push_str(" 󰚰");
+    }
 
     let mut tip = Vec::new();
     match mode {
@@ -195,6 +205,11 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if let Some(e) = daemon.and_then(|v| v["error"].as_str()) {
         tip.push(format!("error: {e}"));
     }
+    if let Some((installed, latest)) = &update {
+        tip.push(format!(
+            "wsconnect update: {installed} → {latest} (wsconnect update)"
+        ));
+    }
     tip.push("click: pause/resume everything · right-click: menu".into());
 
     let class = match mode {
@@ -205,6 +220,11 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
         Some(Mode::Paused) => "paused",
         Some(Mode::Idle) if !ble && kp.is_none() => "nophone",
         Some(Mode::Idle) => "idle",
+    };
+    // Plain string unless outdated, so existing CSS keeps matching.
+    let class = match update {
+        Some(_) => json!([class, "outdated"]),
+        None => json!(class),
     };
     json!({"text": text, "tooltip": tip.join("\n"), "class": class})
 }
@@ -221,6 +241,26 @@ mod tests {
         let w = format_waybar(Some(&v), &KdeView::Unknown);
         assert_eq!(w["text"], "󰀂 81% ▆");
         assert_eq!(w["class"], "tethered");
+    }
+
+    #[test]
+    fn flags_outdated() {
+        let mut v = json!({"mode": "idle", "paused": false, "phone": {"connected": false, "state": null},
+            "update": {"installed": "abc1234", "latest": "def5678"}});
+        let w = format_waybar(Some(&v), &kde_phone(true));
+        assert_eq!(w["text"], "󰄜 55% ▄ 󰚰");
+        assert_eq!(w["class"], json!(["idle", "outdated"]));
+        assert!(
+            w["tooltip"]
+                .as_str()
+                .unwrap()
+                .contains("wsconnect update: abc1234 → def5678 (wsconnect update)")
+        );
+        v["update"] = Value::Null;
+        let w = format_waybar(Some(&v), &kde_phone(true));
+        assert_eq!(w["text"], "󰄜 55% ▄");
+        assert_eq!(w["class"], "idle");
+        assert!(!w["tooltip"].as_str().unwrap().contains("update"));
     }
 
     fn kde_phone(reachable: bool) -> KdeView {

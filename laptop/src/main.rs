@@ -7,13 +7,14 @@ mod logic;
 mod net;
 mod phone;
 mod proto;
+mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 /// Laptop side of workstation-connect: phone internet on demand over BLE.
 #[derive(Parser)]
-#[command(version)]
+#[command(version = update::VERSION)]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
@@ -45,6 +46,12 @@ enum Command {
     Screen,
     /// One-time kdeconnectd setup: notifications to phone, Bluetooth link, share folder.
     Setup,
+    /// Reinstall wsconnect from GitHub main (cargo install), restart the daemon.
+    Update {
+        /// Wait for Enter at the end (menu runs it in a fresh terminal).
+        #[arg(long, hide = true)]
+        pause: bool,
+    },
 }
 
 #[tokio::main]
@@ -68,6 +75,7 @@ async fn main() -> Result<()> {
         Command::Browse => actions::run(actions::Action::Browse, vec![]).await,
         Command::Screen => actions::run(actions::Action::Screen, vec![]).await,
         Command::Setup => actions::setup().await,
+        Command::Update { pause } => update::run(pause).await,
         cmd => {
             let req = match cmd {
                 Command::Pause => "pause",

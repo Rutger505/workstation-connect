@@ -44,6 +44,8 @@ pub struct Status {
     pub phone: Link,
     pub offline_secs: Option<u64>,
     pub error: Option<String>,
+    /// Only when the installed wsconnect is behind GitHub main.
+    pub update: Option<crate::update::Update>,
 }
 
 struct Ctx {
@@ -120,6 +122,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         phone: Link::default(),
         offline_secs: None,
         error: None,
+        update: None,
     });
     let ctx = Arc::new(Ctx {
         cfg,
@@ -142,6 +145,8 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
         }
     });
+    let c = ctx.clone();
+    tokio::spawn(async move { crate::update::watch(|u| c.set(|s| s.update = u)).await });
     tokio::spawn(sleep_guard(ctx.clone()));
     tokio::spawn(serve_socket(ctx.clone()));
 
