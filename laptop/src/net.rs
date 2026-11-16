@@ -1,6 +1,7 @@
-//! NetworkManager: state over D-Bus (polled), actions via nmcli.
+//! NetworkManager: state over D-Bus (polled; Wi-Fi device changes as events), actions via nmcli.
 
 use anyhow::{Context, Result, bail};
+use futures::{Stream, StreamExt};
 use std::time::Duration;
 use tokio::process::Command;
 use zbus::proxy::CacheProperties;
@@ -19,6 +20,18 @@ trait NetworkManager {
     #[zbus(property)]
     fn active_connections(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
     fn check_connectivity(&self) -> zbus::Result<u32>;
+    fn get_devices(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager.Device",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+trait Device {
+    #[zbus(property)]
+    fn device_type(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn active_connection(&self) -> zbus::Result<OwnedObjectPath>;
 }
 
 #[zbus::proxy(
@@ -39,6 +52,7 @@ const CONNECTIVITY_FULL: u32 = 4;
 const NM_STATE_CONNECTING: u32 = 40;
 const NM_STATE_CONNECTED_GLOBAL: u32 = 70;
 const ACTIVE_ACTIVATING: u32 = 1;
+const DEVICE_TYPE_WIFI: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
@@ -107,6 +121,43 @@ impl Nm {
             snap.active.push(ActiveConn { id, kind });
         }
         Ok(snap)
+    }
+
+    /// The Wi-Fi device's active connection as `(object path, id)`, now and on every change.
+    /// Path "/" (id empty) = not connected.
+    pub async fn wifi_connections(&self) -> Result<impl Stream<Item = (String, String)> + '_> {
+        let nm = self.manager().await?;
+        let mut wifi = None;
+        for path in nm.get_devices().await? {
+            let dev = DeviceProxy::builder(&self.bus).path(path)?.build().await?;
+            if dev.device_type().await? == DEVICE_TYPE_WIFI {
+                wifi = Some(dev);
+                break;
+            }
+        }
+        let dev = wifi.context("no Wi-Fi device")?;
+        let changes = dev.receive_active_connection_changed().await;
+        Ok(changes.then(move |c| async move {
+            let Ok(path) = c.get().await else {
+                return ("/".to_string(), String::new());
+            };
+            let id = self.active_id(&path).await.unwrap_or_else(|| "?".into());
+            (path.to_string(), id)
+        }))
+    }
+
+    async fn active_id(&self, path: &OwnedObjectPath) -> Option<String> {
+        if path.as_str() == "/" {
+            return Some(String::new());
+        }
+        let ac = ActiveConnectionProxy::builder(&self.bus)
+            .path(path.clone())
+            .ok()?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .ok()?;
+        ac.id().await.ok()
     }
 
     /// Ask NM to re-run its connectivity check now (it otherwise waits up to 5 min).

@@ -2,12 +2,12 @@
 //! switches back to known Wi-Fi, turns everything off on sleep or pause.
 
 use crate::config::Config;
-use crate::logic::OfflineTimer;
+use crate::logic::{self, OfflineTimer};
 use crate::net::{self, Nm, Snapshot};
 use crate::phone::{Link, Phone};
-use crate::proto::Cmd;
+use crate::proto::{self, Cmd};
 use anyhow::{Context, Result, bail};
-use futures::StreamExt;
+use futures::{StreamExt, pin_mut};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -148,6 +148,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let c = ctx.clone();
     tokio::spawn(async move { crate::update::watch(|u| c.set(|s| s.update = u)).await });
     tokio::spawn(sleep_guard(ctx.clone()));
+    tokio::spawn(wifi_guard(ctx.clone()));
     tokio::spawn(serve_socket(ctx.clone()));
 
     loop {
@@ -407,6 +408,59 @@ async fn try_known_wifi(ctx: &Ctx, epoch: u64, id: &str) -> Result<bool> {
         warn!("hotspot back up: {e:#}");
     }
     Ok(false)
+}
+
+/// The phone's KDE Connect keeps a dead TCP link "connected" for ~15 min after the laptop leaves
+/// its network; tell it over BLE whenever the Wi-Fi connection goes away.
+async fn wifi_guard(ctx: Arc<Ctx>) {
+    loop {
+        let res: Result<()> = async {
+            let changes = ctx.nm.wifi_connections().await?;
+            pin_mut!(changes);
+            let Some(mut prev) = changes.next().await else {
+                bail!("no Wi-Fi state");
+            };
+            while let Some(new) = changes.next().await {
+                if logic::wifi_left(&prev.0, &new.0) {
+                    let (old, new) = (name(&prev.1), name(&new.1));
+                    tokio::spawn(tell_net_changed(ctx.clone(), format!("{old} → {new}")));
+                }
+                prev = new;
+            }
+            bail!("Wi-Fi watch ended")
+        }
+        .await;
+        if let Err(e) = res {
+            warn!("wifi watch: {e:#}");
+        }
+        sleep(Duration::from_secs(30)).await;
+    }
+}
+
+fn name(id: &str) -> &str {
+    if id.is_empty() { "none" } else { id }
+}
+
+/// Fire and forget: a dropped Wi-Fi isn't worth queueing for a phone that's out of reach.
+async fn tell_net_changed(ctx: Arc<Ctx>, change: String) {
+    let link = ctx.phone.link();
+    match link.state.filter(|_| link.connected) {
+        None => info!("wifi changed ({change}): phone not connected, not telling it"),
+        Some(st) if st.version < proto::NET_CHANGED_VERSION => {
+            info!(
+                "wifi changed ({change}): phone app v{} too old to drop LAN links",
+                st.version
+            )
+        }
+        Some(_) => match ctx
+            .phone
+            .send(Cmd::NetChanged, Duration::from_secs(3))
+            .await
+        {
+            Ok(()) => info!("wifi changed ({change}): told the phone to drop LAN links"),
+            Err(e) => warn!("wifi changed ({change}): {e:#}"),
+        },
+    }
 }
 
 #[zbus::proxy(

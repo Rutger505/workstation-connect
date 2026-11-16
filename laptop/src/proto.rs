@@ -13,7 +13,13 @@ pub enum Cmd {
     Off = 0,
     On = 1,
     BtOff = 2,
+    /// Laptop's Wi-Fi network changed or dropped: drop your KDE Connect LAN links to me.
+    /// Only for phones reporting version >= 2 ([`NET_CHANGED_VERSION`]).
+    NetChanged = 3,
 }
+
+/// First phone protocol version that understands [`Cmd::NetChanged`].
+pub const NET_CHANGED_VERSION: u8 = 2;
 
 const FLAG_SHIZUKU: u8 = 1;
 const FLAG_BT_TETHER: u8 = 2;
@@ -31,11 +37,13 @@ pub struct PhoneState {
     pub battery: u8,
     /// 0-4, None when unknown
     pub signal: Option<u8>,
+    /// Phone app's protocol version.
+    pub version: u8,
 }
 
 impl PhoneState {
     pub fn parse(b: &[u8]) -> Option<Self> {
-        let [flags, battery, signal, _version, ..] = *b else {
+        let [flags, battery, signal, version, ..] = *b else {
             return None;
         };
         Some(Self {
@@ -46,6 +54,7 @@ impl PhoneState {
             error: flags & FLAG_ERROR != 0,
             battery,
             signal: (signal <= 4).then_some(signal),
+            version,
         })
     }
 }
@@ -56,9 +65,9 @@ mod tests {
 
     #[test]
     fn parses_state() {
-        let s = PhoneState::parse(&[1 | 4 | 8, 87, 3, 1]).unwrap();
+        let s = PhoneState::parse(&[1 | 4 | 8, 87, 3, 2]).unwrap();
         assert!(s.shizuku && s.hotspot && s.wanted && !s.bt_tether && !s.error);
-        assert_eq!((s.battery, s.signal), (87, Some(3)));
+        assert_eq!((s.battery, s.signal, s.version), (87, Some(3), 2));
         assert_eq!(PhoneState::parse(&[0, 50, 255, 1]).unwrap().signal, None);
         assert!(PhoneState::parse(&[0, 1]).is_none());
     }

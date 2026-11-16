@@ -38,9 +38,28 @@ impl OfflineTimer {
     }
 }
 
+/// The Wi-Fi device's active connection (NM object path, "/" = none) moved away from one it had:
+/// the phone's KDE Connect LAN links to us are dead. Connecting from nothing isn't a change.
+pub fn wifi_left(prev: &str, new: &str) -> bool {
+    prev != "/" && prev != new
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wifi_left_only_when_leaving_a_connection() {
+        let (a, b) = (
+            "/org/freedesktop/NetworkManager/ActiveConnection/1",
+            "/org/freedesktop/NetworkManager/ActiveConnection/2",
+        );
+        assert!(wifi_left(a, "/"));
+        assert!(wifi_left(a, b));
+        assert!(!wifi_left("/", a));
+        assert!(!wifi_left(a, a));
+        assert!(!wifi_left("/", "/"));
+    }
 
     const T: Duration = Duration::from_secs(10);
 

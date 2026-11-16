@@ -23,8 +23,10 @@ Phone ↔ laptop link for a Pixel 9 and an Arch/Hyprland laptop.
    itself off.
 
 BLE protocol (both sides: `Proto.kt` in the app, `proto.rs`), service `6f2b0001-3c1d-4e8a-9f41-7a5d2c9e0b10`:
-- `…0002` control, write, encrypted: `0` off, `1` on, `2` Bluetooth tethering off
-- `…0003` state, read/notify, encrypted: `[flags, battery %, signal 0-4|255, version]`,
+- `…0002` control, write, encrypted: `0` off, `1` on, `2` Bluetooth tethering off, `3` laptop's
+  Wi-Fi changed/dropped: drop KDE Connect LAN links to it (sent on every change away from a Wi-Fi
+  connection, only to version >= 2; else the dead TCP link stays "connected" ~15 min)
+- `…0003` state, read/notify, encrypted: `[flags, battery %, signal 0-4|255, version]` (version 2),
   flags: 1 Shizuku ready, 2 BT tethered, 4 hotspot on, 8 wanted, 16 last command failed
 
 ## Setup
