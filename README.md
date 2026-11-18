@@ -77,7 +77,8 @@ echo '{"remote": ["org.kde.kdeconnect.daemon"]}' > ~/.config/xdg-desktop-portal-
 printf '[D-BUS Service]\nName=org.kde.kdeconnect\nExec=/usr/bin/kdeconnectd\nSystemdService=app-org.kde.kdeconnect.daemon@autostart.service\n' \
   > ~/.local/share/dbus-1/services/org.kde.kdeconnect.service
 
-wsconnect setup   # once, after pairing in the app: laptop notifications → phone, Bluetooth link, share_dir
+wsconnect setup   # once, after pairing in the app: laptop notifications → phone, Bluetooth link, share_dir;
+                  # fixes /etc/bluetooth/main.conf with sudo (Experimental = true, [GATT] Cache = no)
 systemctl --user enable --now wsconnect
 journalctl --user -fu wsconnect
 ```
@@ -97,7 +98,7 @@ Outdated install (GitHub main has newer `laptop/` commits; daemon checks every 1
 tooltip shows `installed → latest`, class becomes `["<class>", "outdated"]`, menu gets
 **Update wsconnect**.
 Phone in reach over LE but our GATT service missing 3 tries in a row (app's service stopped or stale
-BlueZ cache): text gets `󰀦`, class gets `service-missing`. `wsconnect setup` checks main.conf.
+BlueZ cache): text gets `󰀦`, class gets `service-missing`. `wsconnect setup` fixes main.conf.
 
 CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.

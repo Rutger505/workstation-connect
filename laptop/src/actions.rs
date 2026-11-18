@@ -87,24 +87,9 @@ pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
 }
 
 /// One-time kdeconnectd setup for the phone: laptop notifications → phone, Bluetooth link (no shared
-/// network needed), incoming files/photos folder. Checks BlueZ's config. Safe to re-run.
+/// network needed), incoming files/photos folder. Fixes BlueZ's config (sudo). Safe to re-run.
 pub async fn setup() -> Result<()> {
-    match std::fs::read_to_string(BLUEZ_CONF) {
-        Ok(conf) => {
-            let fixes = bluez_fixes(&conf);
-            if fixes.is_empty() {
-                println!("bluez {BLUEZ_CONF}: ok");
-            }
-            let restart = !fixes.is_empty();
-            for (why, sed) in fixes {
-                println!("bluez {BLUEZ_CONF}: {why}, fix:\n  sudo sed -i '{sed}' {BLUEZ_CONF}");
-            }
-            if restart {
-                println!("  sudo systemctl restart bluetooth");
-            }
-        }
-        Err(e) => println!("bluez {BLUEZ_CONF}: can't read ({e})"),
-    }
+    bluez_setup().await;
 
     let cfg = Config::load().ok();
     let kde = Kde::connect().await?;
@@ -173,6 +158,46 @@ fn bluez_fixes(conf: &str) -> Vec<(&'static str, &'static str)> {
         ));
     }
     fixes
+}
+
+/// Applies missing BlueZ settings with sudo (prompts for the password) and restarts bluetoothd.
+/// On failure prints the commands instead; the rest of setup doesn't depend on it.
+async fn bluez_setup() {
+    let conf = match std::fs::read_to_string(BLUEZ_CONF) {
+        Ok(c) => c,
+        Err(e) => return println!("bluez {BLUEZ_CONF}: can't read ({e})"),
+    };
+    let fixes = bluez_fixes(&conf);
+    if fixes.is_empty() {
+        return println!("bluez {BLUEZ_CONF}: ok");
+    }
+    let mut sed = vec!["sed".to_string(), "-i".into()];
+    for (why, script) in &fixes {
+        println!("bluez {BLUEZ_CONF}: {why}");
+        sed.extend(["-e".into(), script.to_string()]);
+    }
+    sed.push(BLUEZ_CONF.into());
+    println!("bluez: fixing with sudo, then restarting bluetooth (other devices drop briefly)");
+    let ok = sudo(&sed).await
+        && std::fs::read_to_string(BLUEZ_CONF).is_ok_and(|c| bluez_fixes(&c).is_empty())
+        && sudo(&["systemctl", "restart", "bluetooth"]).await;
+    if ok {
+        println!("bluez {BLUEZ_CONF}: fixed, bluetooth restarted");
+    } else {
+        let scripts: Vec<_> = fixes.iter().map(|(_, s)| format!("-e '{s}'")).collect();
+        println!(
+            "bluez {BLUEZ_CONF}: not fixed, run:\n  sudo sed -i {} {BLUEZ_CONF}\n  sudo systemctl restart bluetooth",
+            scripts.join(" ")
+        );
+    }
+}
+
+async fn sudo<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> bool {
+    Command::new("sudo")
+        .args(args)
+        .status()
+        .await
+        .is_ok_and(|s| s.success())
 }
 
 /// Value of an uncommented `key = value` in `[section]`.
