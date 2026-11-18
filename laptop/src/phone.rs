@@ -5,9 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bluer::agent::{Agent, RequestConfirmation};
 use bluer::gatt::WriteOp;
 use bluer::gatt::remote::{Characteristic, CharacteristicWriteRequest};
-use bluer::{
-    Adapter, Address, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport, Session,
-};
+use bluer::{Adapter, Address, DiscoveryFilter, DiscoveryTransport, Session};
 use futures::{FutureExt, StreamExt, pin_mut};
 use serde::Serialize;
 use std::time::Duration;
@@ -31,6 +29,11 @@ const CALL: Duration = Duration::from_secs(30);
 const SETUP: Duration = Duration::from_secs(180);
 /// Consecutive "service missing" tries before the tray warns.
 const MISSING_WARN: u32 = 3;
+/// GATT service discovery after our own LE connect.
+const DISCOVERY: Duration = Duration::from_secs(30);
+/// Same on an LE link we found already up: BlueZ doesn't rerun discovery on an existing link,
+/// so ServicesResolved can stay false forever there. Drop it and connect fresh instead.
+const ADOPTED_DISCOVERY: Duration = Duration::from_secs(8);
 
 /// Connected over LE, but our service isn't among the phone's GATT services.
 #[derive(Debug)]
@@ -149,7 +152,7 @@ async fn connect_and_serve(
     cmds: &mut mpsc::Receiver<Request>,
     link: &watch::Sender<Link>,
 ) -> Result<()> {
-    let (device, le, control, state) = timeout(SETUP, connect(session, adapter, addr))
+    let (le, control, state) = timeout(SETUP, connect(session, adapter, addr))
         .await
         .with_context(|| {
             format!(
@@ -160,7 +163,6 @@ async fn connect_and_serve(
     // Subscribe before the first read, and only report "connected" once both worked: a value
     // pushed in between isn't lost, and a hanging StartNotify (phone app never answering the
     // CCCD write) can't leave us half-linked with the phone thinking we're subscribed.
-    let events = call("device events", device.events()).await?;
     let notify = call("subscribe STATE", state.notify()).await?;
     info!("phone link: subscribed to STATE");
     let initial = call("read STATE", state.read()).await?;
@@ -176,12 +178,13 @@ async fn connect_and_serve(
     });
     info!("phone connected: {parsed:?}");
 
-    pin_mut!(notify, events);
+    pin_mut!(notify);
     let mut le_check = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             _ = le_check.tick() => {
-                // Device-level Connected stays true while BR/EDR is up; the LE link is what we use.
+                // Only the LE bearer counts: Device1.Connected covers BR/EDR too (KDE Connect,
+                // tethering) and flips to false on BR/EDR changes while LE stays up.
                 // A failing/hanging read means bluetoothd lost the bearer or got stuck: reconnect.
                 if !call("LE state", le.connected()).await? {
                     bail!("LE link lost");
@@ -191,10 +194,6 @@ async fn connect_and_serve(
                 let v = v.ok_or_else(|| anyhow!("notifications ended"))?;
                 link.send_modify(|l| l.state = PhoneState::parse(&v).or(l.state));
             }
-            ev = events.next() => match ev {
-                Some(DeviceEvent::PropertyChanged(DeviceProperty::Connected(false))) | None => bail!("disconnected"),
-                _ => {}
-            },
             Some((cmd, reply)) = cmds.recv() => {
                 if reply.is_closed() { continue; } // caller gave up
                 let req = CharacteristicWriteRequest { op_type: WriteOp::Request, ..Default::default() };
@@ -227,7 +226,7 @@ async fn connect(
     session: &Session,
     adapter: &Adapter,
     addr: Address,
-) -> Result<(bluer::Device, LeBearer, Characteristic, Characteristic)> {
+) -> Result<(LeBearer, Characteristic, Characteristic)> {
     if !call("paired?", adapter.device(addr)?.is_paired())
         .await
         .unwrap_or(false)
@@ -238,7 +237,8 @@ async fn connect(
         Some(found) => found,
         None => pair_le(session, adapter, addr).await?,
     };
-    if call("LE state", le.connected()).await? {
+    let adopted = call("LE state", le.connected()).await?;
+    if adopted {
         // BlueZ autoconnect, a Connect of an earlier attempt that landed late, another process:
         // use it. Connect on it would just hang until BlueZ's service discovery is done.
         info!(
@@ -253,9 +253,29 @@ async fn connect(
         }
         info!("phone link: LE connected");
     }
-    let (control, state) = resolve(&device, &le).await?;
+    let wait = if adopted {
+        ADOPTED_DISCOVERY
+    } else {
+        DISCOVERY
+    };
+    let Some((control, state)) = resolve(&device, &le, wait).await? else {
+        if adopted {
+            warn!(
+                "phone link: adopted LE link has no service discovery after {}s: dropping it for \
+                 a fresh connect",
+                wait.as_secs()
+            );
+            le_drop(&le).await;
+            bail!("service discovery stalled on adopted LE link: dropped it, reconnecting");
+        }
+        bail!(
+            "service discovery stalled (LE connected, services resolved: false after {}s): \
+             retrying",
+            wait.as_secs()
+        );
+    };
     info!("phone link: workstation-connect service found");
-    Ok((device, le, control, state))
+    Ok((le, control, state))
 }
 
 /// Bring the LE link up; returns as soon as Bearer.LE1 says Connected, without waiting for
@@ -294,14 +314,34 @@ async fn le_connect(adapter: &Adapter, le: &LeBearer) -> Result<()> {
     .context("LE connect timed out (app running? Bluetooth on? in range?)")?
 }
 
-/// Wait for GATT service discovery and find our service in it.
+/// Disconnect the LE bearer and wait (max 5 s) until it's down. Best effort: the next round
+/// copes with a link that's still up.
+async fn le_drop(le: &LeBearer) {
+    if let Err(e) = call("LE disconnect", le.disconnect()).await {
+        warn!("phone link: {e:#}");
+    }
+    // 5.87's Disconnect doesn't abort a pending Connect: check the bearer actually went down.
+    let down = timeout(Duration::from_secs(5), async {
+        while call("LE state", le.connected()).await.unwrap_or(true) {
+            sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await;
+    if down.is_err() {
+        warn!("phone link: LE still connected 5s after Disconnect");
+    }
+}
+
+/// Wait for GATT service discovery and find our service in it. None: services still not
+/// resolved after `wait` while LE is up (discovery stalled).
 async fn resolve(
     device: &bluer::Device,
     le: &LeBearer,
-) -> Result<(Characteristic, Characteristic)> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    wait: Duration,
+) -> Result<Option<(Characteristic, Characteristic)>> {
+    let deadline = tokio::time::Instant::now() + wait;
     let mut logged: Option<usize> = None;
-    let (le_up, resolved, seen) = loop {
+    let (resolved, seen) = loop {
         let le_up = call("LE state", le.connected()).await?;
         if !le_up {
             bail!("link dropped during service discovery (LE disconnected): retrying");
@@ -323,7 +363,7 @@ async fn resolve(
             logged = Some(services.len());
         }
         if let Some(c) = find_chars(&services).await? {
-            return Ok(c);
+            return Ok(Some(c));
         }
         if tokio::time::Instant::now() >= deadline {
             let mut seen = Vec::new();
@@ -332,15 +372,17 @@ async fn resolve(
                     seen.push(u.to_string());
                 }
             }
-            break (le_up, resolved, seen);
+            break (resolved, seen);
         }
         sleep(Duration::from_millis(500)).await;
     };
-    if !(le_up && resolved && !seen.is_empty()) {
+    if !resolved {
+        return Ok(None);
+    }
+    if seen.is_empty() {
         bail!(
-            "link dropped during service discovery (LE connected: {le_up}, services resolved: \
-             {resolved}, GATT services: [{}]): retrying",
-            seen.join(", ")
+            "service discovery stalled (LE connected, services resolved, no GATT services): \
+             retrying"
         );
     }
     Err(ServiceMissing {
@@ -555,6 +597,10 @@ impl LeBearer {
 
     async fn connected(&self) -> zbus::Result<bool> {
         self.0.get_property("Connected").await
+    }
+
+    async fn disconnect(&self) -> zbus::Result<()> {
+        self.0.call("Disconnect", &()).await
     }
 
     async fn connect(&self) -> Result<()> {
