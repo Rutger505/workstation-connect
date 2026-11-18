@@ -430,8 +430,8 @@ async fn service_missing(device: &bluer::Device, le: &LeBearer) -> ServiceMissin
     let le_up = le.connected().await.ok();
     let msg = format!(
         "workstation-connect service not found on phone (LE connected: {}, GATT services: [{}]); \
-         app outdated or service stopped? Stale BlueZ GATT cache: `Cache = no` under [GATT] in \
-         /etc/bluetooth/main.conf (wsconnect setup checks it)",
+         phone app's GATT server is gone: toggle Bluetooth off/on on the phone \
+         (BlueZ cache: `Cache = no` under [GATT], wsconnect setup checks it)",
         le_up.map_or("?".into(), |c| c.to_string()),
         seen.join(", ")
     );

@@ -188,7 +188,7 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if missing {
         tip.push(
             "phone in reach over LE but its workstation-connect service is missing: \
-             app stopped, or stale BlueZ cache (sudo systemctl restart bluetooth)"
+             toggle Bluetooth off/on on the phone (app GATT server gone)"
                 .into(),
         );
     }

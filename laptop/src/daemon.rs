@@ -604,7 +604,11 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
         "status" => {}
         "pause" => pause(true),
         "resume" => pause(false),
-        "toggle" => pause(!*ctx.paused.borrow()),
+        "toggle" => {
+            // copy first: a borrow() guard alive during send_replace deadlocks the channel
+            let on = *ctx.paused.borrow();
+            pause(!on)
+        }
         "watch" => {
             let mut rx = ctx.status.subscribe();
             loop {
