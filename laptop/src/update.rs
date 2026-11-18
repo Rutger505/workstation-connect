@@ -152,35 +152,109 @@ pub async fn run(pause: bool) -> Result<()> {
     r
 }
 
-/// Persistent build dir: `cargo install` otherwise builds in a temp dir and recompiles every
-/// dependency on each update. Safe to delete (next update is a full build again).
-fn target_dir() -> std::path::PathBuf {
+/// Persistent clone + build dir under ~/.cache/wsconnect. `cargo install --git` with a kept
+/// target dir reused the old wsconnect build after a new commit (git sources aren't fingerprinted
+/// by content), so update builds a local clone with `--path`: mtime fingerprints catch every change.
+/// Safe to delete (next update is a full build again).
+fn cache_dir() -> std::path::PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")
         })
-        .join("wsconnect/target")
+        .join("wsconnect")
+}
+
+async fn run_ok(cmd: &mut Command, what: &str) -> Result<()> {
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("start {what}"))?;
+    if !status.success() {
+        bail!("{what}: {status}");
+    }
+    Ok(())
+}
+
+async fn git_out(src: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(src)
+        .args(args)
+        .output()
+        .await?;
+    if !out.status.success() {
+        bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 async fn install() -> Result<()> {
-    let status = Command::new("cargo")
-        .args([
-            "install",
-            "--git",
-            GIT_URL,
-            "wsconnect",
-            "--force",
-            "--locked",
-            "--target-dir",
-        ])
-        .arg(target_dir())
-        .status()
-        .await
-        .context("start cargo")?;
-    if !status.success() {
-        bail!("cargo install: {status}");
+    let cache = cache_dir();
+    let src = cache.join("src");
+    if !src.join(".git").exists() {
+        if src.exists() {
+            std::fs::remove_dir_all(&src).with_context(|| format!("remove {}", src.display()))?;
+        }
+        std::fs::create_dir_all(&cache)?;
+        run_ok(
+            Command::new("git")
+                .args(["clone", "--quiet", GIT_URL])
+                .arg(&src),
+            "git clone",
+        )
+        .await?;
+    } else {
+        run_ok(
+            Command::new("git")
+                .arg("-C")
+                .arg(&src)
+                .args(["fetch", "--quiet", "origin", "main"]),
+            "git fetch",
+        )
+        .await?;
+        run_ok(
+            Command::new("git").arg("-C").arg(&src).args([
+                "checkout",
+                "--quiet",
+                "--force",
+                "-B",
+                "main",
+                "FETCH_HEAD",
+            ]),
+            "git checkout",
+        )
+        .await?;
     }
+    let head = git_out(&src, &["rev-parse", "HEAD"]).await?;
+    let head = head.get(..7).unwrap_or(&head).to_string();
+    run_ok(
+        Command::new("cargo")
+            .args(["install", "--force", "--locked", "--path"])
+            .arg(src.join("laptop"))
+            .arg("--target-dir")
+            .arg(cache.join("target")),
+        "cargo install",
+    )
+    .await?;
+    // Guard against a stale build ever again: the installed binary must report the fetched commit.
+    let out = Command::new("wsconnect")
+        .arg("--version")
+        .output()
+        .await
+        .context("run wsconnect")?;
+    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !version.contains(&format!("({head})")) {
+        bail!(
+            "installed `{version}`, expected commit {head} (PATH has another wsconnect, or stale build: delete {})",
+            cache.display()
+        );
+    }
+    println!("installed {version}");
     let active = Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", "wsconnect"])
         .status()
