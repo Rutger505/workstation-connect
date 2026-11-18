@@ -99,6 +99,11 @@ tooltip shows `installed → latest`, class becomes `["<class>", "outdated"]`, m
 **Update wsconnect**.
 Phone in reach over LE but our GATT service missing 3 tries in a row (app's service stopped or stale
 BlueZ cache): text gets `󰀦`, class gets `service-missing`. `wsconnect setup` fixes main.conf.
+Link drops during service discovery (LE down / no services) don't count, they just retry.
+Connect sequence in the journal (`phone link: …`): LE connect start / already connected → LE
+connected → services resolved (count) → service found → subscribed → first STATE read → `phone
+connected`. Status says connected only after subscribe + first read. LE connect timeouts log RSSI,
+LE/device Connected, ServicesResolved and discovery state.
 
 CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.

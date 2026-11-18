@@ -149,7 +149,7 @@ async fn connect_and_serve(
     cmds: &mut mpsc::Receiver<Request>,
     link: &watch::Sender<Link>,
 ) -> Result<()> {
-    let (device, le, control, state, initial) = timeout(SETUP, connect(session, adapter, addr))
+    let (device, le, control, state) = timeout(SETUP, connect(session, adapter, addr))
         .await
         .with_context(|| {
             format!(
@@ -157,20 +157,25 @@ async fn connect_and_serve(
                 SETUP.as_secs()
             )
         })??;
+    // Subscribe before the first read, and only report "connected" once both worked: a value
+    // pushed in between isn't lost, and a hanging StartNotify (phone app never answering the
+    // CCCD write) can't leave us half-linked with the phone thinking we're subscribed.
+    let events = call("device events", device.events()).await?;
+    let notify = call("subscribe STATE", state.notify()).await?;
+    info!("phone link: subscribed to STATE");
+    let initial = call("read STATE", state.read()).await?;
+    let parsed = PhoneState::parse(&initial);
+    info!(
+        "phone link: first STATE read ({} bytes): {parsed:?}",
+        initial.len()
+    );
     link.send_replace(Link {
         connected: true,
-        state: PhoneState::parse(&initial),
+        state: parsed,
         service_missing: false,
     });
-    info!("phone connected: {:?}", link.borrow().state);
+    info!("phone connected: {parsed:?}");
 
-    let notify = timeout(CALL, state.notify())
-        .await
-        .context("subscribe state: bluetoothd not answering")?
-        .context("subscribe state")?;
-    let events = timeout(CALL, device.events())
-        .await
-        .context("device events: bluetoothd not answering")??;
     pin_mut!(notify, events);
     let mut le_check = tokio::time::interval(Duration::from_secs(5));
     loop {
@@ -178,7 +183,7 @@ async fn connect_and_serve(
             _ = le_check.tick() => {
                 // Device-level Connected stays true while BR/EDR is up; the LE link is what we use.
                 // A failing/hanging read means bluetoothd lost the bearer or got stuck: reconnect.
-                if !timeout(CALL, le.connected()).await.context("LE state: bluetoothd not answering")?.context("LE state")? {
+                if !call("LE state", le.connected()).await? {
                     bail!("LE link lost");
                 }
             }
@@ -206,58 +211,169 @@ async fn connect_and_serve(
     }
 }
 
-/// LE-connect the phone and find our service; returns its characteristics + initial state.
+/// One bluetoothd call, bounded by CALL.
+async fn call<T, E: Into<anyhow::Error>>(
+    what: &str,
+    f: impl Future<Output = std::result::Result<T, E>>,
+) -> Result<T> {
+    match timeout(CALL, f).await {
+        Ok(r) => r.map_err(Into::into).context(what.to_owned()),
+        Err(_) => Err(anyhow!("{what}: bluetoothd not answering")),
+    }
+}
+
+/// LE-connect the phone (or adopt an LE link that's already up) and find our service.
 async fn connect(
     session: &Session,
     adapter: &Adapter,
     addr: Address,
-) -> Result<(
-    bluer::Device,
-    LeBearer,
-    Characteristic,
-    Characteristic,
-    Vec<u8>,
-)> {
-    if !adapter.device(addr)?.is_paired().await.unwrap_or(false) {
+) -> Result<(bluer::Device, LeBearer, Characteristic, Characteristic)> {
+    if !call("paired?", adapter.device(addr)?.is_paired())
+        .await
+        .unwrap_or(false)
+    {
         bail!("{addr} is not paired: bluetoothctl pair {addr} && bluetoothctl trust {addr}");
     }
-    let (device, le) = match find_le_device(adapter, addr).await? {
+    let (device, le) = match call("find LE device", find_le_device(adapter, addr)).await? {
         Some(found) => found,
         None => pair_le(session, adapter, addr).await?,
     };
-    if !le.connected().await? {
-        // Kernels before 7.4 (397464709a20) connect from a passive scan filtered on the accept
-        // list, which drops the phone's private address when the controller can't resolve it
-        // itself. Discovery scans unfiltered and the kernel resolves the address with the IRK.
-        let discovery = le_discovery(adapter).await?;
-        let connect = le.connect();
-        pin_mut!(discovery, connect);
-        timeout(Duration::from_secs(30), async {
-            loop {
-                tokio::select! {
-                    r = &mut connect => return r,
-                    _ = discovery.next() => {}
+    if call("LE state", le.connected()).await? {
+        // BlueZ autoconnect, a Connect of an earlier attempt that landed late, another process:
+        // use it. Connect on it would just hang until BlueZ's service discovery is done.
+        info!(
+            "phone link: LE already connected ({}), using it",
+            device.address()
+        );
+    } else {
+        info!("phone link: LE connect to {} starting", device.address());
+        if let Err(e) = le_connect(adapter, &le).await {
+            let diag = diagnostics(adapter, &device, &le).await;
+            bail!("{e:#} [{diag}]");
+        }
+        info!("phone link: LE connected");
+    }
+    let (control, state) = resolve(&device, &le).await?;
+    info!("phone link: workstation-connect service found");
+    Ok((device, le, control, state))
+}
+
+/// Bring the LE link up; returns as soon as Bearer.LE1 says Connected, without waiting for
+/// Connect's reply, which BlueZ only sends after its GATT service discovery.
+async fn le_connect(adapter: &Adapter, le: &LeBearer) -> Result<()> {
+    // Kernels before 7.4 (397464709a20) connect from a passive scan filtered on the accept
+    // list, which drops the phone's private address when the controller can't resolve it
+    // itself. Discovery scans unfiltered and the kernel resolves the address with the IRK.
+    let discovery = le_discovery(adapter).await?;
+    let connect = le.connect();
+    pin_mut!(discovery, connect);
+    let mut poll = tokio::time::interval(Duration::from_millis(500));
+    let mut connect_done = false;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                r = &mut connect, if !connect_done => {
+                    connect_done = true;
+                    if let Err(e) = r {
+                        // E.g. zbus' own timeout while the link did come up meanwhile.
+                        if call("LE state", le.connected()).await? {
+                            warn!("phone link: LE Connect failed ({e:#}) but LE is up: using it");
+                            return Ok(());
+                        }
+                        return Err(e);
+                    }
+                }
+                Some(_) = discovery.next() => {}
+                _ = poll.tick() => if call("LE state", le.connected()).await? {
+                    return Ok(());
                 }
             }
-        })
-        .await
-        .context("LE connect timed out (app running? Bluetooth on? in range?)")??;
-    }
-    let found = timeout(Duration::from_secs(15), async {
-        loop {
-            if let Some(c) = find_chars(&device).await? {
-                return Ok::<_, anyhow::Error>(c);
-            }
-            sleep(Duration::from_millis(500)).await;
         }
     })
-    .await;
-    let (control, state) = match found {
-        Ok(c) => c?,
-        Err(_) => return Err(service_missing(&device, &le).await.into()),
+    .await
+    .context("LE connect timed out (app running? Bluetooth on? in range?)")?
+}
+
+/// Wait for GATT service discovery and find our service in it.
+async fn resolve(
+    device: &bluer::Device,
+    le: &LeBearer,
+) -> Result<(Characteristic, Characteristic)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut logged: Option<usize> = None;
+    let (le_up, resolved, seen) = loop {
+        let le_up = call("LE state", le.connected()).await?;
+        if !le_up {
+            bail!("link dropped during service discovery (LE disconnected): retrying");
+        }
+        let resolved = call("ServicesResolved", device.is_services_resolved()).await?;
+        let services = if resolved {
+            // Errs (unresolved) if the link drops right now; the next round sees that.
+            call("GATT services", device.services())
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if resolved && logged != Some(services.len()) {
+            info!(
+                "phone link: services resolved, {} GATT services",
+                services.len()
+            );
+            logged = Some(services.len());
+        }
+        if let Some(c) = find_chars(&services).await? {
+            return Ok(c);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let mut seen = Vec::new();
+            for s in &services {
+                if let Ok(u) = call("service UUID", s.uuid()).await {
+                    seen.push(u.to_string());
+                }
+            }
+            break (le_up, resolved, seen);
+        }
+        sleep(Duration::from_millis(500)).await;
     };
-    let initial = state.read().await.context("read state (bonded over LE?)")?;
-    Ok((device, le, control, state, initial))
+    if !(le_up && resolved && !seen.is_empty()) {
+        bail!(
+            "link dropped during service discovery (LE connected: {le_up}, services resolved: \
+             {resolved}, GATT services: [{}]): retrying",
+            seen.join(", ")
+        );
+    }
+    Err(ServiceMissing {
+        le_connected: true,
+        msg: format!(
+            "workstation-connect service not found on phone (LE connected, GATT services: [{}]); \
+             phone app's GATT server is gone: toggle Bluetooth off/on on the phone \
+             (BlueZ cache: `Cache = no` under [GATT], wsconnect setup checks it)",
+            seen.join(", ")
+        ),
+    }
+    .into())
+}
+
+/// What BlueZ knows about the phone, for a failed LE connect: was it even visible?
+async fn diagnostics(adapter: &Adapter, device: &bluer::Device, le: &LeBearer) -> String {
+    async fn probe<T: std::fmt::Debug, E: std::fmt::Display>(
+        f: impl Future<Output = std::result::Result<T, E>>,
+    ) -> String {
+        match timeout(Duration::from_secs(5), f).await {
+            Ok(Ok(v)) => format!("{v:?}"),
+            Ok(Err(e)) => format!("error: {e}"),
+            Err(_) => "no answer".into(),
+        }
+    }
+    format!(
+        "RSSI: {}, LE connected: {}, device connected: {}, services resolved: {}, discovering: {}",
+        probe(device.rssi()).await,
+        probe(le.connected()).await,
+        probe(device.is_connected()).await,
+        probe(device.is_services_resolved()).await,
+        probe(adapter.is_discovering()).await,
+    )
 }
 
 /// The phone's BlueZ object that is bonded over LE. A BR/EDR-only bond isn't: BlueZ then lacks
@@ -399,14 +515,16 @@ async fn advertises_service(device: &bluer::Device) -> bool {
     seen && unpaired && ours
 }
 
-async fn find_chars(device: &bluer::Device) -> Result<Option<(Characteristic, Characteristic)>> {
-    for service in device.services().await? {
-        if service.uuid().await? != proto::SERVICE {
+async fn find_chars(
+    services: &[bluer::gatt::remote::Service],
+) -> Result<Option<(Characteristic, Characteristic)>> {
+    for service in services {
+        if call("service UUID", service.uuid()).await? != proto::SERVICE {
             continue;
         }
         let (mut control, mut state) = (None, None);
-        for c in service.characteristics().await? {
-            match c.uuid().await? {
+        for c in call("characteristics", service.characteristics()).await? {
+            match call("characteristic UUID", c.uuid()).await? {
                 u if u == proto::CONTROL => control = Some(c),
                 u if u == proto::STATE => state = Some(c),
                 _ => {}
@@ -418,27 +536,6 @@ async fn find_chars(device: &bluer::Device) -> Result<Option<(Characteristic, Ch
         )));
     }
     Ok(None)
-}
-
-async fn service_missing(device: &bluer::Device, le: &LeBearer) -> ServiceMissing {
-    let mut seen = Vec::new();
-    for s in device.services().await.unwrap_or_default() {
-        if let Ok(u) = s.uuid().await {
-            seen.push(u.to_string());
-        }
-    }
-    let le_up = le.connected().await.ok();
-    let msg = format!(
-        "workstation-connect service not found on phone (LE connected: {}, GATT services: [{}]); \
-         phone app's GATT server is gone: toggle Bluetooth off/on on the phone \
-         (BlueZ cache: `Cache = no` under [GATT], wsconnect setup checks it)",
-        le_up.map_or("?".into(), |c| c.to_string()),
-        seen.join(", ")
-    );
-    ServiceMissing {
-        le_connected: le_up == Some(true),
-        msg,
-    }
 }
 
 /// org.bluez.Bearer.LE1: the LE link's own state/connect, separate from BR/EDR.
