@@ -19,7 +19,33 @@ use tracing::{info, warn};
 pub struct Link {
     pub connected: bool,
     pub state: Option<PhoneState>,
+    /// LE link up but our GATT service missing on several tries in a row: app's service stopped,
+    /// or BlueZ serves a stale GATT cache of the phone.
+    pub service_missing: bool,
 }
+
+/// Any single D-Bus call to bluetoothd. bluer's own is 120 s, zbus has none: a bluetoothd that
+/// never answers (seen after resume from hibernate) hung the daemon silently.
+const CALL: Duration = Duration::from_secs(30);
+/// Everything from opening the session to "phone connected", incl. a first-run LE pairing.
+const SETUP: Duration = Duration::from_secs(180);
+/// Consecutive "service missing" tries before the tray warns.
+const MISSING_WARN: u32 = 3;
+
+/// Connected over LE, but our service isn't among the phone's GATT services.
+#[derive(Debug)]
+struct ServiceMissing {
+    le_connected: bool,
+    msg: String,
+}
+
+impl std::fmt::Display for ServiceMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for ServiceMissing {}
 
 type Request = (Cmd, oneshot::Sender<Result<()>>);
 
@@ -68,18 +94,39 @@ impl Phone {
 
 async fn run(addr: Address, mut cmds: mpsc::Receiver<Request>, link: watch::Sender<Link>) {
     let mut backoff = Duration::from_secs(2);
+    let mut missing = 0;
     loop {
         let started = std::time::Instant::now();
         let res = async {
-            let session = bluer::Session::new().await?;
-            let adapter = session.default_adapter().await?;
-            if !adapter.is_powered().await? {
+            let (session, adapter) = timeout(CALL, async {
+                let session = bluer::Session::new().await?;
+                let adapter = session.default_adapter().await?;
+                anyhow::Ok((session, adapter))
+            })
+            .await
+            .context("bluetoothd not answering")??;
+            if !timeout(CALL, adapter.is_powered())
+                .await
+                .context("bluetoothd not answering")??
+            {
                 bail!("bluetooth adapter is off");
             }
             connect_and_serve(&session, &adapter, addr, &mut cmds, &link).await
         }
         .await;
-        link.send_replace(Link::default());
+        match &res {
+            Err(e)
+                if e.downcast_ref::<ServiceMissing>()
+                    .is_some_and(|m| m.le_connected) =>
+            {
+                missing += 1
+            }
+            _ => missing = 0,
+        }
+        link.send_replace(Link {
+            service_missing: missing >= MISSING_WARN,
+            ..Default::default()
+        });
         if let Err(e) = res {
             warn!("phone link: {e:#}");
         }
@@ -102,6 +149,75 @@ async fn connect_and_serve(
     cmds: &mut mpsc::Receiver<Request>,
     link: &watch::Sender<Link>,
 ) -> Result<()> {
+    let (device, le, control, state, initial) = timeout(SETUP, connect(session, adapter, addr))
+        .await
+        .with_context(|| {
+            format!(
+                "no connection after {}s: bluetoothd stuck?",
+                SETUP.as_secs()
+            )
+        })??;
+    link.send_replace(Link {
+        connected: true,
+        state: PhoneState::parse(&initial),
+        service_missing: false,
+    });
+    info!("phone connected: {:?}", link.borrow().state);
+
+    let notify = timeout(CALL, state.notify())
+        .await
+        .context("subscribe state: bluetoothd not answering")?
+        .context("subscribe state")?;
+    let events = timeout(CALL, device.events())
+        .await
+        .context("device events: bluetoothd not answering")??;
+    pin_mut!(notify, events);
+    let mut le_check = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = le_check.tick() => {
+                // Device-level Connected stays true while BR/EDR is up; the LE link is what we use.
+                // A failing/hanging read means bluetoothd lost the bearer or got stuck: reconnect.
+                if !timeout(CALL, le.connected()).await.context("LE state: bluetoothd not answering")?.context("LE state")? {
+                    bail!("LE link lost");
+                }
+            }
+            v = notify.next() => {
+                let v = v.ok_or_else(|| anyhow!("notifications ended"))?;
+                link.send_modify(|l| l.state = PhoneState::parse(&v).or(l.state));
+            }
+            ev = events.next() => match ev {
+                Some(DeviceEvent::PropertyChanged(DeviceProperty::Connected(false))) | None => bail!("disconnected"),
+                _ => {}
+            },
+            Some((cmd, reply)) = cmds.recv() => {
+                if reply.is_closed() { continue; } // caller gave up
+                let req = CharacteristicWriteRequest { op_type: WriteOp::Request, ..Default::default() };
+                let res = match timeout(CALL, control.write_ext(&[cmd as u8], &req)).await {
+                    Ok(r) => r.map_err(|e| anyhow!("write {cmd:?}: {e}")),
+                    Err(_) => Err(anyhow!("write {cmd:?}: bluetoothd not answering")),
+                };
+                info!("sent {cmd:?}: {res:?}");
+                let failed = res.is_err();
+                let _ = reply.send(res);
+                if failed { bail!("write failed"); }
+            }
+        }
+    }
+}
+
+/// LE-connect the phone and find our service; returns its characteristics + initial state.
+async fn connect(
+    session: &Session,
+    adapter: &Adapter,
+    addr: Address,
+) -> Result<(
+    bluer::Device,
+    LeBearer,
+    Characteristic,
+    Characteristic,
+    Vec<u8>,
+)> {
     if !adapter.device(addr)?.is_paired().await.unwrap_or(false) {
         bail!("{addr} is not paired: bluetoothctl pair {addr} && bluetoothctl trust {addr}");
     }
@@ -138,47 +254,10 @@ async fn connect_and_serve(
     .await;
     let (control, state) = match found {
         Ok(c) => c?,
-        Err(_) => bail!(service_missing(&device, &le).await),
+        Err(_) => return Err(service_missing(&device, &le).await.into()),
     };
-
     let initial = state.read().await.context("read state (bonded over LE?)")?;
-    link.send_replace(Link {
-        connected: true,
-        state: PhoneState::parse(&initial),
-    });
-    info!("phone connected: {:?}", link.borrow().state);
-
-    let notify = state.notify().await.context("subscribe state")?;
-    let events = device.events().await?;
-    pin_mut!(notify, events);
-    let mut le_check = tokio::time::interval(Duration::from_secs(5));
-    loop {
-        tokio::select! {
-            _ = le_check.tick() => {
-                // Device-level Connected stays true while BR/EDR is up; the LE link is what we use.
-                if !le.connected().await.unwrap_or(true) {
-                    bail!("LE link lost");
-                }
-            }
-            v = notify.next() => {
-                let v = v.ok_or_else(|| anyhow!("notifications ended"))?;
-                link.send_modify(|l| l.state = PhoneState::parse(&v).or(l.state));
-            }
-            ev = events.next() => match ev {
-                Some(DeviceEvent::PropertyChanged(DeviceProperty::Connected(false))) | None => bail!("disconnected"),
-                _ => {}
-            },
-            Some((cmd, reply)) = cmds.recv() => {
-                if reply.is_closed() { continue; } // caller gave up
-                let req = CharacteristicWriteRequest { op_type: WriteOp::Request, ..Default::default() };
-                let res = control.write_ext(&[cmd as u8], &req).await;
-                info!("sent {cmd:?}: {res:?}");
-                let failed = res.is_err();
-                let _ = reply.send(res.map_err(|e| anyhow!("write {cmd:?}: {e}")));
-                if failed { bail!("write failed"); }
-            }
-        }
-    }
+    Ok((device, le, control, state, initial))
 }
 
 /// The phone's BlueZ object that is bonded over LE. A BR/EDR-only bond isn't: BlueZ then lacks
@@ -190,7 +269,10 @@ async fn find_le_device(
     adapter: &Adapter,
     addr: Address,
 ) -> Result<Option<(bluer::Device, LeBearer)>> {
-    let bus = zbus::Connection::system().await?;
+    let bus = zbus::connection::Builder::system()?
+        .method_timeout(CALL)
+        .build()
+        .await?;
     let objects = zbus::fdo::ObjectManagerProxy::builder(&bus)
         .destination("org.bluez")?
         .path("/")?
@@ -338,18 +420,25 @@ async fn find_chars(device: &bluer::Device) -> Result<Option<(Characteristic, Ch
     Ok(None)
 }
 
-async fn service_missing(device: &bluer::Device, le: &LeBearer) -> String {
+async fn service_missing(device: &bluer::Device, le: &LeBearer) -> ServiceMissing {
     let mut seen = Vec::new();
     for s in device.services().await.unwrap_or_default() {
         if let Ok(u) = s.uuid().await {
             seen.push(u.to_string());
         }
     }
-    let le_up = le.connected().await.map_or("?".into(), |c| c.to_string());
-    format!(
-        "workstation-connect service not found on phone (LE connected: {le_up}, GATT services: [{}]); app outdated or service stopped?",
+    let le_up = le.connected().await.ok();
+    let msg = format!(
+        "workstation-connect service not found on phone (LE connected: {}, GATT services: [{}]); \
+         app outdated or service stopped? Stale BlueZ GATT cache: `Cache = no` under [GATT] in \
+         /etc/bluetooth/main.conf (wsconnect setup checks it)",
+        le_up.map_or("?".into(), |c| c.to_string()),
         seen.join(", ")
-    )
+    );
+    ServiceMissing {
+        le_connected: le_up == Some(true),
+        msg,
+    }
 }
 
 /// org.bluez.Bearer.LE1: the LE link's own state/connect, separate from BR/EDR.

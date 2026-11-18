@@ -163,6 +163,10 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if update.is_some() {
         text.push_str(" 󰚰");
     }
+    let missing = phone.is_some_and(|p| p["service_missing"] == true);
+    if missing {
+        text.push_str(" 󰀦");
+    }
 
     let mut tip = Vec::new();
     match mode {
@@ -180,6 +184,13 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
         } else {
             "bluetooth: phone not in reach".into()
         });
+    }
+    if missing {
+        tip.push(
+            "phone in reach over LE but its workstation-connect service is missing: \
+             app stopped, or stale BlueZ cache (sudo systemctl restart bluetooth)"
+                .into(),
+        );
     }
     if ble && state.is_some_and(|s| s["shizuku"] == false) {
         tip.push("Shizuku not running on phone".into());
@@ -221,10 +232,17 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
         Some(Mode::Idle) if !ble && kp.is_none() => "nophone",
         Some(Mode::Idle) => "idle",
     };
-    // Plain string unless outdated, so existing CSS keeps matching.
-    let class = match update {
-        Some(_) => json!([class, "outdated"]),
-        None => json!(class),
+    // Plain string unless flagged, so existing CSS keeps matching.
+    let mut classes = vec![class];
+    if update.is_some() {
+        classes.push("outdated");
+    }
+    if missing {
+        classes.push("service-missing");
+    }
+    let class = match classes[..] {
+        [c] => json!(c),
+        _ => json!(classes),
     };
     json!({"text": text, "tooltip": tip.join("\n"), "class": class})
 }
@@ -273,6 +291,21 @@ mod tests {
             network: Some("5G".into()),
             signal: Some(2),
         })
+    }
+
+    #[test]
+    fn flags_service_missing() {
+        let v = json!({"mode": "idle", "paused": false,
+            "phone": {"connected": false, "state": null, "service_missing": true}});
+        let w = format_waybar(Some(&v), &kde_phone(true));
+        assert_eq!(w["text"], "󰄜 55% ▄ 󰀦");
+        assert_eq!(w["class"], json!(["idle", "service-missing"]));
+        assert!(
+            w["tooltip"]
+                .as_str()
+                .unwrap()
+                .contains("service is missing")
+        );
     }
 
     #[test]

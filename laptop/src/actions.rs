@@ -87,8 +87,25 @@ pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
 }
 
 /// One-time kdeconnectd setup for the phone: laptop notifications → phone, Bluetooth link (no shared
-/// network needed), incoming files/photos folder. Safe to re-run.
+/// network needed), incoming files/photos folder. Checks BlueZ's config. Safe to re-run.
 pub async fn setup() -> Result<()> {
+    match std::fs::read_to_string(BLUEZ_CONF) {
+        Ok(conf) => {
+            let fixes = bluez_fixes(&conf);
+            if fixes.is_empty() {
+                println!("bluez {BLUEZ_CONF}: ok");
+            }
+            let restart = !fixes.is_empty();
+            for (why, sed) in fixes {
+                println!("bluez {BLUEZ_CONF}: {why}, fix:\n  sudo sed -i '{sed}' {BLUEZ_CONF}");
+            }
+            if restart {
+                println!("  sudo systemctl restart bluetooth");
+            }
+        }
+        Err(e) => println!("bluez {BLUEZ_CONF}: can't read ({e})"),
+    }
+
     let cfg = Config::load().ok();
     let kde = Kde::connect().await?;
     let id = phone(&kde).await?;
@@ -134,6 +151,45 @@ pub async fn setup() -> Result<()> {
         );
     }
     Ok(())
+}
+
+const BLUEZ_CONF: &str = "/etc/bluetooth/main.conf";
+
+/// Settings the daemon needs that BlueZ's defaults lack: (reason, sed script fixing it).
+fn bluez_fixes(conf: &str) -> Vec<(&'static str, &'static str)> {
+    let mut fixes = Vec::new();
+    if ini_get(conf, "General", "Experimental").is_none_or(|v| v != "true") {
+        fixes.push((
+            "LE bearer API (org.bluez.Bearer.LE1) is experimental, needs Experimental = true",
+            r"/^\[General\]/,/^\[/ s/^#\?Experimental = .*/Experimental = true/",
+        ));
+    }
+    // BlueZ keeps a bonded device's GATT database across connections and trusts it until the
+    // phone signals Service Changed; a missed one left our service invisible for a day.
+    if ini_get(conf, "GATT", "Cache").is_none_or(|v| v != "no") {
+        fixes.push((
+            "GATT cache can go stale (our service then looks missing), needs Cache = no",
+            r"/^\[GATT\]/,/^\[/ s/^#\?Cache = .*/Cache = no/",
+        ));
+    }
+    fixes
+}
+
+/// Value of an uncommented `key = value` in `[section]`.
+fn ini_get<'a>(conf: &'a str, section: &str, key: &str) -> Option<&'a str> {
+    let mut current = "";
+    let mut found = None;
+    for line in conf.lines().map(str::trim) {
+        if let Some(s) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            current = s;
+        } else if current == section
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim() == key
+        {
+            found = Some(v.trim());
+        }
+    }
+    found
 }
 
 fn expand_home(p: &str) -> std::path::PathBuf {
@@ -294,6 +350,15 @@ fn parse_mdns_connect(services: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bluez_conf() {
+        let stock = "[General]\n#Experimental = false\n#KernelExperimental = false\n[GATT]\n#Cache = always\n";
+        assert_eq!(bluez_fixes(stock).len(), 2);
+        let ok = "[General]\nExperimental = true\n[GATT]\n# Cache = always\nCache = no\n[CSIS]\nCache = always\n";
+        assert!(bluez_fixes(ok).is_empty());
+        assert_eq!(ini_get(ok, "CSIS", "Cache"), Some("always"));
+    }
+
     use super::*;
 
     #[test]

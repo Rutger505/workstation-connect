@@ -47,7 +47,9 @@ cp laptop/dist/config.example.toml ~/.config/workstation-connect/config.toml   #
 cp laptop/dist/wsconnect.service ~/.config/systemd/user/
 
 # BlueZ >= 5.84: the daemon uses the LE bearer API (org.bluez.Bearer.LE1), which is experimental
-sudo sed -i 's/^#\?Experimental = .*/Experimental = true/' /etc/bluetooth/main.conf
+sudo sed -i '/^\[General\]/,/^\[/ s/^#\?Experimental = .*/Experimental = true/' /etc/bluetooth/main.conf
+# no GATT cache: a stale one hid our service on a bonded phone for a day (BlueZ missed Service Changed)
+sudo sed -i '/^\[GATT\]/,/^\[/ s/^#\?Cache = .*/Cache = no/' /etc/bluetooth/main.conf
 sudo systemctl restart bluetooth
 
 # pair once (phone: Settings → Connected devices → Pair new device)
@@ -94,6 +96,8 @@ CSS classes: `idle`, `nophone`, `offline`, `activating`, `tethered`, `paused`, `
 Outdated install (GitHub main has newer `laptop/` commits; daemon checks every 15 min and on every network reconnect): text gets `󰚰`,
 tooltip shows `installed → latest`, class becomes `["<class>", "outdated"]`, menu gets
 **Update wsconnect**.
+Phone in reach over LE but our GATT service missing 3 tries in a row (app's service stopped or stale
+BlueZ cache): text gets `󰀦`, class gets `service-missing`. `wsconnect setup` checks main.conf.
 
 CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
