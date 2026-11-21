@@ -28,7 +28,7 @@ pub enum Mode {
     Offline,
     /// Asked the phone, bringing up BT / hotspot.
     Activating,
-    /// On the phone's Bluetooth tethering (slow), hotspot still coming.
+    /// On the phone's Bluetooth tethering (with `hotspot = true`: hotspot still coming).
     Bluetooth,
     /// On the phone's hotspot.
     Hotspot,
@@ -85,6 +85,15 @@ impl Ctx {
 
     fn abort_running(&self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_hotspot(&self, snap: &Snapshot) -> bool {
+        self.cfg.hotspot_id().is_some_and(|h| snap.is_active(h))
+    }
+
+    /// Already on the phone's Bluetooth tethering or hotspot.
+    fn phone_net(&self, snap: &Snapshot) -> bool {
+        self.on_hotspot(snap) || snap.is_active(&self.cfg.bt_connection)
     }
 
     fn on_phone(&self) -> bool {
@@ -186,10 +195,8 @@ async fn idle(ctx: &Ctx) {
     let mut timer = OfflineTimer::default();
     let threshold = Duration::from_secs(ctx.cfg.offline_secs);
     let mut resumes = ctx.resumes.subscribe();
-    let exclude = [
-        ctx.cfg.hotspot_connection.as_str(),
-        ctx.cfg.bt_connection.as_str(),
-    ];
+    let mut exclude = vec![ctx.cfg.bt_connection.as_str()];
+    exclude.extend(ctx.cfg.hotspot_id());
     loop {
         if *ctx.paused.borrow() {
             ctx.set(|s| {
@@ -214,7 +221,7 @@ async fn idle(ctx: &Ctx) {
                 continue;
             }
         };
-        if snap.is_active(&ctx.cfg.hotspot_connection) || snap.is_active(&ctx.cfg.bt_connection) {
+        if ctx.phone_net(&snap) {
             info!("already on the phone: taking over");
             return;
         }
@@ -271,8 +278,8 @@ async fn idle(ctx: &Ctx) {
 
 async fn activate(ctx: &Ctx, epoch: u64) -> Result<()> {
     let snap = ctx.nm.snapshot().await?;
-    if snap.is_active(&ctx.cfg.hotspot_connection) || snap.is_active(&ctx.cfg.bt_connection) {
-        ctx.mode(if snap.is_active(&ctx.cfg.hotspot_connection) {
+    if ctx.phone_net(&snap) {
+        ctx.mode(if ctx.on_hotspot(&snap) {
             Mode::Hotspot
         } else {
             Mode::Bluetooth
@@ -286,36 +293,21 @@ async fn activate(ctx: &Ctx, epoch: u64) -> Result<()> {
     });
     info!("offline: asking the phone");
     drop_dead_wifi(&snap).await;
-    ctx.phone.send(Cmd::On, Duration::from_secs(10)).await?;
+    ctx.phone.send(on_cmd(ctx), Duration::from_secs(10)).await?;
     check(ctx, epoch)?;
 
     // Bluetooth first: internet within seconds.
-    let mut bt = false;
-    if ctx
-        .phone
-        .wait_for(Duration::from_secs(15), |s| s.bt_tether)
-        .await
-    {
-        for _ in 0..3 {
-            check(ctx, epoch)?;
-            match net::up(&ctx.cfg.bt_connection, 15).await {
-                Ok(()) => {
-                    bt = true;
-                    break;
-                }
-                Err(e) => {
-                    warn!("bt up: {e:#}");
-                    sleep(Duration::from_secs(2)).await;
-                }
-            }
-        }
-    } else {
-        warn!("phone didn't report BT tethering; going straight for the hotspot");
-    }
-    check(ctx, epoch)?;
+    let bt = bt_up(ctx, epoch).await?;
     if bt {
         ctx.mode(Mode::Bluetooth);
         ctx.nm.recheck().await;
+        info!("on the phone's Bluetooth tethering");
+    }
+    if !ctx.cfg.hotspot {
+        if bt {
+            return Ok(());
+        }
+        bail!("phone gave no Bluetooth tethering");
     }
 
     // Then the hotspot: the speed.
@@ -328,6 +320,50 @@ async fn activate(ctx: &Ctx, epoch: u64) -> Result<()> {
         return Ok(());
     }
     bail!("phone gave neither Bluetooth tethering nor hotspot")
+}
+
+/// Bluetooth only unless the config wants the hotspot too.
+fn on_cmd(ctx: &Ctx) -> Cmd {
+    if ctx.cfg.hotspot {
+        return Cmd::On;
+    }
+    match ctx.phone.link().state {
+        Some(st) if st.version >= proto::BT_ONLY_VERSION => Cmd::OnBt,
+        Some(st) => {
+            warn!(
+                "phone app v{} can't do Bluetooth only: it starts the hotspot too",
+                st.version
+            );
+            Cmd::On
+        }
+        None => Cmd::On,
+    }
+}
+
+/// Connects right after "on", without waiting for the phone's BT tether flag: the phone's bt-pan
+/// interface (and so the flag) only appears once we connect.
+async fn bt_up(ctx: &Ctx, epoch: u64) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for attempt in 1.. {
+        check(ctx, epoch)?;
+        match net::up(&ctx.cfg.bt_connection, 15).await {
+            Ok(()) => {
+                info!("bt up (attempt {attempt})");
+                return Ok(true);
+            }
+            Err(e) => {
+                warn!("bt up (attempt {attempt}): {e:#}");
+                if ctx.phone.link().state.is_some_and(|s| s.error) {
+                    warn!("phone reports a failed tether command (see its app log)");
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Wi-Fi that's connected without internet (captive portal) would keep the default route.
@@ -344,13 +380,16 @@ async fn drop_dead_wifi(snap: &Snapshot) {
 }
 
 async fn try_hotspot(ctx: &Ctx, epoch: u64, within: Duration) -> Result<bool> {
+    let Some(hotspot) = ctx.cfg.hotspot_id() else {
+        return Ok(false);
+    };
     let deadline = Instant::now() + within;
     ctx.phone
         .wait_for(Duration::from_secs(20), |s| s.hotspot)
         .await;
     while Instant::now() < deadline {
         check(ctx, epoch)?;
-        match net::up(&ctx.cfg.hotspot_connection, 15).await {
+        match net::up(hotspot, 15).await {
             Ok(()) => return Ok(true),
             Err(e) => {
                 warn!("hotspot up: {e:#}");
@@ -380,7 +419,6 @@ async fn switched_to_hotspot(ctx: &Ctx) {
 
 /// On the phone until a known Wi-Fi works again, the phone connection drops, or pause/sleep.
 async fn on_phone(ctx: &Ctx, epoch: u64) -> Result<()> {
-    let hotspot = ctx.cfg.hotspot_connection.as_str();
     let bt = ctx.cfg.bt_connection.as_str();
     let mut tried: HashSet<String> = HashSet::new();
     let mut last_scan = Instant::now();
@@ -389,7 +427,7 @@ async fn on_phone(ctx: &Ctx, epoch: u64) -> Result<()> {
         sleep(Duration::from_secs(1)).await;
         check(ctx, epoch)?;
         let snap = ctx.nm.snapshot().await?;
-        let (on_hotspot, on_bt) = (snap.is_active(hotspot), snap.is_active(bt));
+        let (on_hotspot, on_bt) = (ctx.on_hotspot(&snap), snap.is_active(bt));
         if !on_hotspot && !on_bt {
             warn!("phone connection gone");
             let _ = ctx.phone.send(Cmd::Off, Duration::from_secs(5)).await;
@@ -401,7 +439,11 @@ async fn on_phone(ctx: &Ctx, epoch: u64) -> Result<()> {
             Mode::Bluetooth
         });
 
-        if on_bt && !on_hotspot && last_hotspot_try.elapsed() >= Duration::from_secs(20) {
+        if ctx.cfg.hotspot
+            && on_bt
+            && !on_hotspot
+            && last_hotspot_try.elapsed() >= Duration::from_secs(20)
+        {
             if try_hotspot(ctx, epoch, Duration::from_secs(15)).await? {
                 switched_to_hotspot(ctx).await;
             }
@@ -410,13 +452,14 @@ async fn on_phone(ctx: &Ctx, epoch: u64) -> Result<()> {
 
         if last_scan.elapsed() >= Duration::from_secs(60) {
             last_scan = Instant::now();
-            let mut exclude: Vec<&str> = vec![hotspot, bt];
+            let mut exclude: Vec<&str> = vec![bt];
+            exclude.extend(ctx.cfg.hotspot_id());
             exclude.extend(tried.iter().map(String::as_str));
             match net::known_wifi_in_range(&exclude, &ctx.cfg.ignore_ssids).await {
                 Ok(Some(id)) => {
                     // Each network gets one try per session: no flapping between hotspot and bad Wi-Fi.
                     tried.insert(id.clone());
-                    if try_known_wifi(ctx, epoch, &id).await? {
+                    if try_known_wifi(ctx, epoch, &id, on_hotspot).await? {
                         let _ = ctx.phone.send(Cmd::Off, Duration::from_secs(10)).await;
                         info!("back on {id}: phone off");
                         return Ok(());
@@ -429,7 +472,9 @@ async fn on_phone(ctx: &Ctx, epoch: u64) -> Result<()> {
     }
 }
 
-async fn try_known_wifi(ctx: &Ctx, epoch: u64, id: &str) -> Result<bool> {
+/// `from_hotspot`: the Wi-Fi replaced the hotspot on the same radio, so a failure brings it back;
+/// from Bluetooth the dead Wi-Fi goes down (it would win the default route).
+async fn try_known_wifi(ctx: &Ctx, epoch: u64, id: &str, from_hotspot: bool) -> Result<bool> {
     info!("known Wi-Fi in range: trying {id}");
     if net::up(id, 20).await.is_ok() {
         ctx.nm.recheck().await;
@@ -445,9 +490,25 @@ async fn try_known_wifi(ctx: &Ctx, epoch: u64, id: &str) -> Result<bool> {
             sleep(Duration::from_secs(1)).await;
         }
     }
-    warn!("{id} has no internet: back to the hotspot");
-    if let Err(e) = net::up(&ctx.cfg.hotspot_connection, 20).await {
-        warn!("hotspot back up: {e:#}");
+    match ctx.cfg.hotspot_id().filter(|_| from_hotspot) {
+        Some(hotspot) => {
+            warn!("{id} has no internet: back to the hotspot");
+            if let Err(e) = net::up(hotspot, 20).await {
+                warn!("hotspot back up: {e:#}");
+            }
+        }
+        None => {
+            warn!("{id} has no internet: back to Bluetooth");
+            if let Err(e) = net::down(id).await {
+                warn!("{e:#}");
+            }
+            let bt = &ctx.cfg.bt_connection;
+            if !ctx.nm.snapshot().await?.is_active(bt)
+                && let Err(e) = net::up(bt, 15).await
+            {
+                warn!("bt back up: {e:#}");
+            }
+        }
     }
     Ok(false)
 }

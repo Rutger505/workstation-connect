@@ -16,10 +16,15 @@ pub enum Cmd {
     /// Laptop's Wi-Fi network changed or dropped: drop your KDE Connect LAN links to me.
     /// Only for phones reporting version >= 2 ([`NET_CHANGED_VERSION`]).
     NetChanged = 3,
+    /// Bluetooth tethering only, no hotspot. Only for phones reporting version >= 3
+    /// ([`BT_ONLY_VERSION`]); older ones get [`Cmd::On`].
+    OnBt = 4,
 }
 
 /// First phone protocol version that understands [`Cmd::NetChanged`].
 pub const NET_CHANGED_VERSION: u8 = 2;
+/// First phone protocol version that understands [`Cmd::OnBt`].
+pub const BT_ONLY_VERSION: u8 = 3;
 
 const FLAG_SHIZUKU: u8 = 1;
 const FLAG_BT_TETHER: u8 = 2;

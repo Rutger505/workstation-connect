@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -10,8 +10,12 @@ pub struct Config {
     pub phone: String,
     /// NetworkManager connection for the phone's Bluetooth tethering (PAN).
     pub bt_connection: String,
-    /// NetworkManager connection for the phone's Wi-Fi hotspot.
-    pub hotspot_connection: String,
+    /// After Bluetooth tethering, also bring up the phone's Wi-Fi hotspot and move there (faster,
+    /// costs phone battery). Default off: Bluetooth tethering only.
+    #[serde(default)]
+    pub hotspot: bool,
+    /// NetworkManager connection for the phone's Wi-Fi hotspot. Needed with `hotspot = true`.
+    pub hotspot_connection: Option<String>,
     /// Seconds offline before asking the phone while a saved Wi-Fi network is in range (NM's
     /// chance to join it). None in range: the phone is asked right away.
     #[serde(default = "default_offline_secs")]
@@ -48,7 +52,21 @@ impl Config {
         let path = dir().join("config.toml");
         let text =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
+        let cfg: Self =
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        if cfg.hotspot && cfg.hotspot_connection.is_none() {
+            bail!(
+                "{}: hotspot = true needs hotspot_connection",
+                path.display()
+            );
+        }
+        Ok(cfg)
+    }
+
+    /// The hotspot connection, if configured (also when `hotspot` is off: a hotspot joined by
+    /// hand still counts as being on the phone).
+    pub fn hotspot_id(&self) -> Option<&str> {
+        self.hotspot_connection.as_deref()
     }
 }
 
@@ -60,10 +78,10 @@ mod tests {
     fn parses_minimal() {
         let c: Config = toml::from_str(
             r#"phone = "AA:BB:CC:DD:EE:FF"
-bt_connection = "Pixel 9 Network"
-hotspot_connection = "Pixel 9""#,
+bt_connection = "Pixel 9 Network""#,
         )
         .unwrap();
+        assert!(!c.hotspot && c.hotspot_id().is_none());
         assert_eq!(c.offline_secs, 15);
         assert!(c.ignore_ssids.is_empty());
     }

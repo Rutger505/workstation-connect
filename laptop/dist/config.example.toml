@@ -4,10 +4,12 @@
 phone = "AA:BB:CC:DD:EE:FF"
 # NetworkManager connection names (nmcli -f NAME,TYPE connection show)
 bt_connection = "Pixel 9 BT"
-hotspot_connection = "Pixel 9 hotspot"
-# Seconds without internet before the phone is asked
-offline_secs = 10
-# Saved Wi-Fi never worth leaving the hotspot for
+# Also bring up the phone's Wi-Fi hotspot after Bluetooth (faster, costs phone battery); default off
+# hotspot = true
+# hotspot_connection = "Pixel 9 hotspot"
+# Seconds without internet before the phone is asked while a saved Wi-Fi is in range (none: at once)
+offline_secs = 15
+# Saved Wi-Fi never worth leaving the phone for
 ignore_ssids = ["WiFi in de trein"]
 # KDE Connect device id or name of the phone (default: first paired smartphone)
 # kdeconnect_device = "Pixel 9"
