@@ -8,8 +8,9 @@ use bluer::gatt::remote::{Characteristic, CharacteristicWriteRequest};
 use bluer::{Adapter, Address, DiscoveryFilter, DiscoveryTransport, Session};
 use futures::{FutureExt, StreamExt, pin_mut};
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
@@ -56,14 +57,22 @@ type Request = (Cmd, oneshot::Sender<Result<()>>);
 pub struct Phone {
     cmds: mpsc::Sender<Request>,
     link: watch::Receiver<Link>,
+    kick: Arc<Notify>,
 }
 
 impl Phone {
     pub fn spawn(addr: Address) -> Self {
         let (cmds, rx) = mpsc::channel(8);
         let (tx, link) = watch::channel(Link::default());
-        tokio::spawn(run(addr, rx, tx));
-        Self { cmds, link }
+        let kick = Arc::new(Notify::new());
+        tokio::spawn(run(addr, rx, tx, kick.clone()));
+        Self { cmds, link, kick }
+    }
+
+    /// Reconnect now instead of finishing the retry backoff (after resume: the link died in the
+    /// suspend and tokio timers stand still while suspended, so a 30 s backoff is still 30 s).
+    pub fn kick(&self) {
+        self.kick.notify_one();
     }
 
     pub fn link(&self) -> Link {
@@ -95,7 +104,12 @@ impl Phone {
     }
 }
 
-async fn run(addr: Address, mut cmds: mpsc::Receiver<Request>, link: watch::Sender<Link>) {
+async fn run(
+    addr: Address,
+    mut cmds: mpsc::Receiver<Request>,
+    link: watch::Sender<Link>,
+    kick: Arc<Notify>,
+) {
     let mut backoff = Duration::from_secs(2);
     let mut missing = 0;
     loop {
@@ -140,8 +154,13 @@ async fn run(addr: Address, mut cmds: mpsc::Receiver<Request>, link: watch::Send
         if started.elapsed() > Duration::from_secs(60) {
             backoff = Duration::from_secs(2); // was a real session, not a failing retry
         }
-        sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(30));
+        tokio::select! {
+            _ = sleep(backoff) => backoff = (backoff * 2).min(Duration::from_secs(30)),
+            _ = kick.notified() => {
+                info!("phone link: reconnecting now (resume)");
+                backoff = Duration::from_secs(2);
+            }
+        }
     }
 }
 

@@ -225,9 +225,24 @@ pub async fn known_wifi_in_range(
     exclude_ids: &[&str],
     exclude_ssids: &[String],
 ) -> Result<Option<String>> {
-    let t = Duration::from_secs(20);
+    let saved = saved_wifi(exclude_ids).await?;
+    let scan = scan().await?;
+    Ok(pick_known(&saved, &scan, exclude_ssids, MIN_SIGNAL))
+}
+
+/// Any saved Wi-Fi network (not excluded) in range at all, i.e. NM may still join one by itself.
+pub async fn known_wifi_visible(exclude_ids: &[&str], exclude_ssids: &[String]) -> Result<bool> {
+    let saved = saved_wifi(exclude_ids).await?;
+    let scan = scan().await?;
+    Ok(pick_known(&saved, &scan, exclude_ssids, 0).is_some())
+}
+
+const NMCLI_SLOW: Duration = Duration::from_secs(20);
+
+/// (connection id, SSID) of saved Wi-Fi connections.
+async fn saved_wifi(exclude_ids: &[&str]) -> Result<Vec<(String, String)>> {
     let mut saved = Vec::new();
-    for line in nmcli(&["-t", "-f", "NAME,TYPE", "connection", "show"], t)
+    for line in nmcli(&["-t", "-f", "NAME,TYPE", "connection", "show"], NMCLI_SLOW)
         .await?
         .lines()
     {
@@ -242,13 +257,18 @@ pub async fn known_wifi_in_range(
                     "id",
                     &f[0],
                 ],
-                t,
+                NMCLI_SLOW,
             )
             .await?;
             saved.push((f[0].clone(), ssid.trim().to_string()));
         }
     }
-    let scan = nmcli(
+    Ok(saved)
+}
+
+/// Fresh scan (blocks until done), `nmcli -t` SSID:SIGNAL lines.
+async fn scan() -> Result<String> {
+    nmcli(
         &[
             "-t",
             "-f",
@@ -259,15 +279,19 @@ pub async fn known_wifi_in_range(
             "--rescan",
             "yes",
         ],
-        t,
+        NMCLI_SLOW,
     )
-    .await?;
-    Ok(pick_known(&saved, &scan, exclude_ssids))
+    .await
 }
 
 const MIN_SIGNAL: u32 = 40;
 
-fn pick_known(saved: &[(String, String)], scan: &str, exclude_ssids: &[String]) -> Option<String> {
+fn pick_known(
+    saved: &[(String, String)],
+    scan: &str,
+    exclude_ssids: &[String],
+    min_signal: u32,
+) -> Option<String> {
     let visible: Vec<(String, u32)> = scan
         .lines()
         .filter_map(|l| {
@@ -284,7 +308,7 @@ fn pick_known(saved: &[(String, String)], scan: &str, exclude_ssids: &[String]) 
                 .filter(|(s, _)| s == ssid)
                 .map(|(_, sig)| *sig)
                 .max()?;
-            (best >= MIN_SIGNAL).then_some((id.clone(), best))
+            (best >= min_signal).then_some((id.clone(), best))
         })
         .max_by_key(|(_, sig)| *sig)
         .map(|(id, _)| id)
@@ -326,9 +350,13 @@ mod tests {
         ];
         let scan = "home:30\neduroam:70\nWiFi in de trein:90\nother:99\n";
         assert_eq!(
-            pick_known(&saved, scan, &["WiFi in de trein".into()]),
+            pick_known(&saved, scan, &["WiFi in de trein".into()], MIN_SIGNAL),
             Some("eduroam".into())
         );
-        assert_eq!(pick_known(&saved, "home:20\n", &[]), None);
+        assert_eq!(pick_known(&saved, "home:20\n", &[], MIN_SIGNAL), None);
+        // "visible at all": weak counts, ignored never does.
+        assert!(pick_known(&saved, "home:20\n", &[], 0).is_some());
+        let train = ["WiFi in de trein".to_string()];
+        assert!(pick_known(&saved, "WiFi in de trein:90\nother:99\n", &train, 0).is_none());
     }
 }

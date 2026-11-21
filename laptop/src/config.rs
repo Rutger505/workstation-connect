@@ -12,7 +12,8 @@ pub struct Config {
     pub bt_connection: String,
     /// NetworkManager connection for the phone's Wi-Fi hotspot.
     pub hotspot_connection: String,
-    /// Seconds without internet before asking the phone.
+    /// Seconds offline before asking the phone while a saved Wi-Fi network is in range (NM's
+    /// chance to join it). None in range: the phone is asked right away.
     #[serde(default = "default_offline_secs")]
     pub offline_secs: u64,
     /// Saved Wi-Fi networks never worth leaving the hotspot for (train Wi-Fi with captive portal).
@@ -27,7 +28,7 @@ pub struct Config {
 }
 
 fn default_offline_secs() -> u64 {
-    10
+    15
 }
 
 pub fn xdg_config() -> PathBuf {
@@ -63,7 +64,7 @@ bt_connection = "Pixel 9 Network"
 hotspot_connection = "Pixel 9""#,
         )
         .unwrap();
-        assert_eq!(c.offline_secs, 10);
+        assert_eq!(c.offline_secs, 15);
         assert!(c.ignore_ssids.is_empty());
     }
 }

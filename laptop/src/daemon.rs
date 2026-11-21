@@ -56,6 +56,8 @@ struct Ctx {
     paused: watch::Sender<bool>,
     /// Bumped on pause and sleep: running flows see the change and bail out without side effects.
     epoch: AtomicU64,
+    /// Bumped on every resume from suspend: offline timer and cooldown start over.
+    resumes: watch::Sender<u64>,
 }
 
 impl Ctx {
@@ -131,6 +133,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         status,
         paused: watch::channel(false).0,
         epoch: AtomicU64::new(0),
+        resumes: watch::channel(0).0,
     });
 
     // Mirror the phone link into the status.
@@ -168,7 +171,11 @@ pub async fn run(cfg: Config) -> Result<()> {
                 ctx.error(format!("{e:#}"));
                 let _ = ctx.phone.send(Cmd::Off, Duration::from_secs(5)).await;
                 ctx.mode(Mode::Cooldown);
-                sleep(Duration::from_secs(60)).await;
+                let mut resumes = ctx.resumes.subscribe();
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(60)) => {}
+                    _ = resumes.changed() => info!("resumed: cooldown over"),
+                }
             }
         }
     }
@@ -178,6 +185,11 @@ pub async fn run(cfg: Config) -> Result<()> {
 async fn idle(ctx: &Ctx) {
     let mut timer = OfflineTimer::default();
     let threshold = Duration::from_secs(ctx.cfg.offline_secs);
+    let mut resumes = ctx.resumes.subscribe();
+    let exclude = [
+        ctx.cfg.hotspot_connection.as_str(),
+        ctx.cfg.bt_connection.as_str(),
+    ];
     loop {
         if *ctx.paused.borrow() {
             ctx.set(|s| {
@@ -191,6 +203,10 @@ async fn idle(ctx: &Ctx) {
         if *ctx.paused.borrow() {
             continue;
         }
+        if resumes.has_changed().unwrap_or(false) {
+            resumes.mark_unchanged();
+            timer.reset(); // pre-suspend scan says nothing about where we woke up
+        }
         let snap = match ctx.nm.snapshot().await {
             Ok(s) => s,
             Err(e) => {
@@ -202,7 +218,30 @@ async fn idle(ctx: &Ctx) {
             info!("already on the phone: taking over");
             return;
         }
-        let now = Instant::now();
+        let mut now = Instant::now();
+        timer.update(snap.online, snap.connecting, now, threshold);
+        if timer.needs_scan(now) {
+            ctx.set(|s| s.mode = Mode::Offline);
+            let known = match net::known_wifi_visible(&exclude, &ctx.cfg.ignore_ssids).await {
+                Ok(k) => {
+                    info!(
+                        "offline: {}",
+                        if k {
+                            "known Wi-Fi in range, giving NetworkManager its chance"
+                        } else {
+                            "no known Wi-Fi in range, asking the phone now"
+                        }
+                    );
+                    Some(k)
+                }
+                Err(e) => {
+                    warn!("offline scan: {e:#}");
+                    None
+                }
+            };
+            now = Instant::now();
+            timer.scanned(known, now);
+        }
         let trigger = timer.update(snap.online, snap.connecting, now, threshold);
         let offline = timer.offline_for(now).map(|d| d.as_secs());
         ctx.set(|s| {
@@ -527,7 +566,12 @@ async fn sleep_guard(ctx: Arc<Ctx>) {
                     }
                 }
                 lock = None; // release: suspend continues
-            } else if lock.is_none() {
+            } else {
+                info!("resumed");
+                ctx.resumes.send_modify(|n| *n += 1);
+                ctx.phone.kick();
+            }
+            if !sig.args()?.start && lock.is_none() {
                 lock = Some(
                     login
                         .inhibit("sleep", "wsconnect", "turn the phone hotspot off", "delay")
