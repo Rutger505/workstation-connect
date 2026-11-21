@@ -111,6 +111,9 @@ async fn run(
     kick: Arc<Notify>,
 ) {
     let mut backoff = Duration::from_secs(2);
+    // After resume the adapter takes a few seconds to come back ("target object ... not
+    // present"): retry every second meanwhile instead of backing off.
+    let mut fast_until = std::time::Instant::now();
     let mut missing = 0;
     loop {
         let started = std::time::Instant::now();
@@ -154,11 +157,15 @@ async fn run(
         if started.elapsed() > Duration::from_secs(60) {
             backoff = Duration::from_secs(2); // was a real session, not a failing retry
         }
+        let fast = std::time::Instant::now() < fast_until;
         tokio::select! {
-            _ = sleep(backoff) => backoff = (backoff * 2).min(Duration::from_secs(30)),
+            _ = sleep(if fast { Duration::from_secs(1) } else { backoff }) => if !fast {
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            },
             _ = kick.notified() => {
                 info!("phone link: reconnecting now (resume)");
                 backoff = Duration::from_secs(2);
+                fast_until = std::time::Instant::now() + Duration::from_secs(20);
             }
         }
     }
@@ -266,7 +273,7 @@ async fn connect(
         );
     } else {
         info!("phone link: LE connect to {} starting", device.address());
-        if let Err(e) = le_connect(adapter, &le).await {
+        if let Err(e) = le_connect(adapter, &device, &le).await {
             let diag = diagnostics(adapter, &device, &le).await;
             bail!("{e:#} [{diag}]");
         }
@@ -299,7 +306,7 @@ async fn connect(
 
 /// Bring the LE link up; returns as soon as Bearer.LE1 says Connected, without waiting for
 /// Connect's reply, which BlueZ only sends after its GATT service discovery.
-async fn le_connect(adapter: &Adapter, le: &LeBearer) -> Result<()> {
+async fn le_connect(adapter: &Adapter, device: &bluer::Device, le: &LeBearer) -> Result<()> {
     // Kernels before 7.4 (397464709a20) connect from a passive scan filtered on the accept
     // list, which drops the phone's private address when the controller can't resolve it
     // itself. Discovery scans unfiltered and the kernel resolves the address with the IRK.
@@ -308,6 +315,10 @@ async fn le_connect(adapter: &Adapter, le: &LeBearer) -> Result<()> {
     pin_mut!(discovery, connect);
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     let mut connect_done = false;
+    // Logs when the phone's advertisement shows up: tells a slow connect apart into "not seen"
+    // (phone advertising/scan) vs "seen, connect slow" (controller/link setup).
+    let started = std::time::Instant::now();
+    let mut seen = false;
     timeout(Duration::from_secs(30), async {
         loop {
             tokio::select! {
@@ -323,8 +334,14 @@ async fn le_connect(adapter: &Adapter, le: &LeBearer) -> Result<()> {
                     }
                 }
                 Some(_) = discovery.next() => {}
-                _ = poll.tick() => if call("LE state", le.connected()).await? {
-                    return Ok(());
+                _ = poll.tick() => {
+                    if !seen && let Ok(Ok(Some(rssi))) = timeout(Duration::from_secs(2), device.rssi()).await {
+                        seen = true;
+                        info!("phone link: phone seen in LE scan after {:.1}s (RSSI {rssi})", started.elapsed().as_secs_f32());
+                    }
+                    if call("LE state", le.connected()).await? {
+                        return Ok(());
+                    }
                 }
             }
         }
