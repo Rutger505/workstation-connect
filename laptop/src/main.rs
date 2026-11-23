@@ -6,6 +6,7 @@ mod daemon;
 mod kde;
 mod logic;
 mod logs;
+mod migrate;
 mod net;
 mod phone;
 mod proto;
@@ -63,7 +64,7 @@ enum Command {
     },
     /// Store the write-only key for log uploads (~/.config/workstation-connect/logs.env).
     LogsKey { access: String, secret: String },
-    /// Reinstall wsconnect from GitHub main (cargo install), restart the daemon.
+    /// Reinstall workstation-connect from GitHub main (cargo install), restart the daemon.
     Update {
         /// Wait for Enter at the end (menu runs it in a fresh terminal).
         #[arg(long, hide = true)]
@@ -79,10 +80,15 @@ async fn main() -> Result<()> {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "wsconnect=info".into()),
+                        .unwrap_or_else(|_| "workstation_connect=info".into()),
                 )
                 .without_time() // journald adds timestamps
                 .init();
+            if let migrate::Outcome::HandedOff = migrate::run() {
+                // Conflicts= stops this unit any moment now; keep running if it somehow doesn't.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                tracing::warn!("migrate: still running in the old unit after the handoff");
+            }
             daemon::run(config::Config::load()?).await
         }
         Command::Waybar => ctl::waybar().await,

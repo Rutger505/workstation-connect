@@ -1,5 +1,5 @@
 //! Log upload to a private S3 bucket (SeaweedFS on cdn.rutgerpronk.com, path-style, SigV4):
-//! the daemon's journal since the last successful upload (+ wsconnect-update, kdeconnectd and
+//! the daemon's journal since the last successful upload (+ workstation-connect-update, kdeconnectd and
 //! best effort the system's Bluetooth lines), so debugging needs no log collecting by hand.
 //! Key: write-only, from ~/.config/workstation-connect/logs.env (never in the repo); missing
 //! file = upload off.
@@ -112,7 +112,7 @@ pub fn load_credentials() -> Result<Option<Credentials>> {
         .with_context(|| format!("{}: needs {ACCESS_VAR}= and {SECRET_VAR}=", path.display()))
 }
 
-/// `wsconnect logs-key`: writes logs.env (mode 600). The daemon reads it per upload.
+/// `workstation-connect logs-key`: writes logs.env (mode 600). The daemon reads it per upload.
 pub fn write_key(access: &str, secret: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -251,15 +251,20 @@ async fn run(cmd: &mut Command) -> Result<(bool, String, String)> {
     ))
 }
 
-/// User journal of wsconnect, the update unit and kdeconnectd after `cursor`.
+/// User journal of workstation-connect, the update unit and kdeconnectd after `cursor`.
 async fn user_journal(cursor: Option<&str>) -> Result<(String, Option<String>)> {
     let mut cmd = Command::new("journalctl");
     cmd.args([
         "--user",
         "-u",
-        "wsconnect",
+        "workstation-connect",
         "-u",
         crate::update::UNIT,
+        // TRANSITIONAL: pre-rename unit names (remove with src/bin/wsconnect.rs).
+        "-u",
+        "wsconnect",
+        "-u",
+        "wsconnect-update",
         "-u",
         "app-org.kde.kdeconnect.daemon@*",
         "-o",
@@ -341,7 +346,7 @@ async fn build(reasons: &[Reason], extra: Option<&str>, now: u64) -> Result<Payl
     let system = system_journal(&since).await;
     let names: Vec<_> = reasons.iter().map(|r| r.as_str()).collect();
     let mut head = format!(
-        "host: {}\nwsconnect: {}\nkernel: {}\nreason: {}\ntime: {}\njournal since: {}\n",
+        "host: {}\nworkstation-connect: {}\nkernel: {}\nreason: {}\ntime: {}\njournal since: {}\n",
         hostname(),
         crate::update::VERSION,
         kernel(),
@@ -399,7 +404,7 @@ fn put_blocking(creds: &Credentials, key: &str, body: String) -> Result<()> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(PUT_TIMEOUT))
         .http_status_as_error(false)
-        .user_agent(concat!("wsconnect/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("workstation-connect/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
     let mut res = agent

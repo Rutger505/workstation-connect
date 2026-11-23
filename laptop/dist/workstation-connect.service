@@ -1,10 +1,12 @@
 [Unit]
 Description=workstation-connect: phone internet on demand
 After=dbus.service
+# TRANSITIONAL: pre-rename unit; starting this one stops it (remove with src/bin/wsconnect.rs)
+Conflicts=wsconnect.service
 
 [Service]
 # env resolves via the user manager PATH (environment.d), so any CARGO_HOME works
-ExecStart=/usr/bin/env wsconnect daemon
+ExecStart=/usr/bin/env workstation-connect daemon
 Restart=always
 RestartSec=5
 

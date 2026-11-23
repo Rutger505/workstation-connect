@@ -34,7 +34,7 @@ impl Action {
             Action::Browse => "󰉋  Browse phone files",
             Action::Screen => "󰍹  Phone screen (scrcpy)",
             Action::Pause => "󰏤  Pause / resume auto hotspot",
-            Action::Update => "󰚰  Update wsconnect",
+            Action::Update => "󰚰  Update workstation-connect",
         }
     }
 }
@@ -183,9 +183,9 @@ pub async fn menu() -> Result<()> {
     }
 }
 
-/// `wsconnect update` in a terminal: xdg-terminal-exec, else $TERMINAL -e.
+/// `workstation-connect update` in a terminal: xdg-terminal-exec, else $TERMINAL -e.
 fn update_in_terminal() -> Result<()> {
-    let args = ["wsconnect", "update", "--pause"];
+    let args = ["workstation-connect", "update", "--pause"];
     let mut cmd = if which("xdg-terminal-exec") {
         std::process::Command::new("xdg-terminal-exec")
     } else {
@@ -223,7 +223,7 @@ fn detect_menu() -> Result<Vec<String>> {
 
 async fn pick_files() -> Result<Vec<std::path::PathBuf>> {
     if !which("zenity") {
-        bail!("no file picker: install zenity, or run `wsconnect send <files>`");
+        bail!("no file picker: install zenity, or run `workstation-connect send <files>`");
     }
     let out = Command::new("zenity")
         .args([
