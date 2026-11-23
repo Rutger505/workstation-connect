@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use tracing::info;
 use zbus::{Connection, Proxy};
 
 const DEST: &str = "org.kde.kdeconnect";
@@ -21,6 +22,36 @@ pub struct Phone {
     /// 0-4
     pub signal: Option<i32>,
 }
+
+/// Everything about the phone's KDE Connect device worth logging / testing.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub paired: bool,
+    pub reachable: bool,
+    /// Active link types, e.g. ["LanLinkProvider"].
+    pub providers: Vec<String>,
+    pub connection: String,
+    /// Loaded plugin ids, sorted, e.g. "kdeconnect_mousepad".
+    pub plugins: Vec<String>,
+    /// D-Bus errors reading the above, verbatim (older kdeconnectd lacks some properties).
+    pub errors: Vec<String>,
+}
+
+/// Plugins worth calling out: (id, what it's for).
+pub const KEY_PLUGINS: [(&str, &str); 7] = [
+    ("kdeconnect_mousepad", "trackpad/mouse input"),
+    ("kdeconnect_remotekeyboard", "keyboard input"),
+    ("kdeconnect_remotecontrol", "remote control"),
+    ("kdeconnect_notifications", "phone notifications"),
+    (
+        "kdeconnect_sendnotifications",
+        "laptop notifications to phone",
+    ),
+    ("kdeconnect_clipboard", "clipboard"),
+    ("kdeconnect_ping", "ping"),
+];
 
 pub struct Kde {
     conn: Connection,
@@ -130,6 +161,63 @@ impl Kde {
         })
     }
 
+    pub async fn device_info(&self, id: &str) -> Result<DeviceInfo> {
+        let dev = self.device(id, None, "org.kde.kdeconnect.device").await?;
+        let mut errors = Vec::new();
+        let mut note = |what: &str, e: zbus::Error| errors.push(format!("{what}: {e}"));
+        let name: String = dev.get_property("name").await?;
+        let reachable: bool = dev.get_property("isReachable").await?;
+        let paired = dev
+            .get_property::<bool>("isPaired")
+            .await
+            .unwrap_or_else(|e| {
+                note("isPaired", e);
+                false
+            });
+        let providers = dev
+            .get_property::<Vec<String>>("activeProviderNames")
+            .await
+            .unwrap_or_else(|e| {
+                note("activeProviderNames", e);
+                vec![]
+            });
+        let connection = dev
+            .get_property::<String>("connectionDescription")
+            .await
+            .unwrap_or_else(|e| {
+                note("connectionDescription", e);
+                String::new()
+            });
+        let mut plugins = dev
+            .call::<_, _, Vec<String>>("loadedPlugins", &())
+            .await
+            .unwrap_or_else(|e| {
+                note("loadedPlugins", e);
+                vec![]
+            });
+        plugins.sort();
+        Ok(DeviceInfo {
+            id: id.into(),
+            name,
+            paired,
+            reachable,
+            providers,
+            connection,
+            plugins,
+            errors,
+        })
+    }
+
+    /// KDE Connect ping: a notification on the phone.
+    pub async fn ping(&self, id: &str, message: &str) -> Result<()> {
+        let p = self
+            .device(id, Some("ping"), "org.kde.kdeconnect.device.ping")
+            .await?;
+        p.call::<_, _, ()>("sendPing", &(message,))
+            .await
+            .context("ping plugin sendPing")
+    }
+
     pub async fn send_clipboard(&self, id: &str) -> Result<()> {
         let p = self
             .device(id, Some("clipboard"), "org.kde.kdeconnect.device.clipboard")
@@ -198,6 +286,7 @@ pub async fn pause_sync(on: bool) -> Result<()> {
             return Ok(()); // already paused (or nothing on): keep the remembered list
         }
         std::fs::write(&state, enabled.join("\n"))?;
+        info!("kde connect: pause: disabling link providers {enabled:?}");
         for id in &enabled {
             kde.set_link_provider(id, false).await?;
         }
@@ -205,12 +294,64 @@ pub async fn pause_sync(on: bool) -> Result<()> {
         let Ok(text) = std::fs::read_to_string(&state) else {
             return Ok(());
         };
+        info!(
+            "kde connect: resume: enabling link providers {:?}",
+            text.lines().collect::<Vec<_>>()
+        );
         for id in text.lines().filter(|l| !l.is_empty()) {
             kde.set_link_provider(id, true).await?;
         }
         std::fs::remove_file(&state)?;
     }
     Ok(())
+}
+
+/// Log lines for a change of the phone's KDE Connect device (all of it when `prev` is None).
+pub fn describe_change(prev: Option<&DeviceInfo>, new: &DeviceInfo) -> Vec<String> {
+    let Some(p) = prev.filter(|p| p.id == new.id) else {
+        let mut l = vec![format!(
+            "kde connect: {} ({}) paired={} reachable={} links={:?} ({}) plugins={:?}",
+            new.name, new.id, new.paired, new.reachable, new.providers, new.connection, new.plugins
+        )];
+        l.extend(new.errors.iter().map(|e| format!("kde connect: D-Bus {e}")));
+        return l;
+    };
+    let mut l = Vec::new();
+    if p.paired != new.paired {
+        l.push(format!("kde connect: {} paired={}", new.name, new.paired));
+    }
+    if p.reachable != new.reachable
+        || p.providers != new.providers
+        || p.connection != new.connection
+    {
+        l.push(format!(
+            "kde connect: {} reachable={} links={:?} ({})",
+            new.name, new.reachable, new.providers, new.connection
+        ));
+    }
+    let added: Vec<_> = new
+        .plugins
+        .iter()
+        .filter(|x| !p.plugins.contains(x))
+        .collect();
+    let removed: Vec<_> = p
+        .plugins
+        .iter()
+        .filter(|x| !new.plugins.contains(x))
+        .collect();
+    if !added.is_empty() || !removed.is_empty() {
+        l.push(format!(
+            "kde connect: {} plugins loaded {added:?}, unloaded {removed:?}",
+            new.name
+        ));
+    }
+    l.extend(
+        new.errors
+            .iter()
+            .filter(|e| !p.errors.contains(e))
+            .map(|e| format!("kde connect: D-Bus {e}")),
+    );
+    l
 }
 
 /// "Bluetooth|bluetooth|enabled" → ("bluetooth", true)
@@ -275,6 +416,37 @@ mod tests {
             Some(("bluetooth".into(), false))
         );
         assert_eq!(parse_provider("garbage"), None);
+    }
+
+    fn info() -> DeviceInfo {
+        DeviceInfo {
+            id: "abc".into(),
+            name: "Pixel 9".into(),
+            paired: true,
+            reachable: true,
+            providers: vec!["LanLinkProvider".into()],
+            connection: "Connected via LAN".into(),
+            plugins: vec!["kdeconnect_mousepad".into(), "kdeconnect_ping".into()],
+            errors: vec![],
+        }
+    }
+
+    #[test]
+    fn describes_kde_changes() {
+        let a = info();
+        assert_eq!(describe_change(None, &a).len(), 1);
+        assert!(describe_change(Some(&a), &a).is_empty());
+        let mut b = a.clone();
+        b.reachable = false;
+        b.providers.clear();
+        b.plugins = vec!["kdeconnect_ping".into(), "kdeconnect_clipboard".into()];
+        let l = describe_change(Some(&a), &b);
+        assert_eq!(l.len(), 2, "{l:?}");
+        assert!(l[0].contains("reachable=false links=[]"), "{l:?}");
+        assert!(
+            l[1].contains("loaded [\"kdeconnect_clipboard\"], unloaded [\"kdeconnect_mousepad\"]"),
+            "{l:?}"
+        );
     }
 
     #[test]

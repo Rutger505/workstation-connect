@@ -16,7 +16,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::time::{sleep, sleep_until, timeout};
 use tracing::{info, warn};
 
@@ -59,6 +59,40 @@ const BACKOFF: [u64; 5] = [2, 5, 10, 30, 60];
 const FAST_WINDOW: Duration = Duration::from_secs(20);
 /// Consecutive "service didn't answer" tries before the tray warns.
 const MISSING_WARN: u32 = 3;
+/// Failed connects in a row (outside the fast window after resume) that count as a failed burst.
+const BURST_FAIL: u32 = 3;
+
+/// Connect outcomes, for log uploads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEvent {
+    Connected,
+    /// A burst of connect attempts failed (keeps retrying with backoff).
+    GaveUp,
+}
+
+/// Counts failed connects since the last connect/kick; reports one GaveUp per burst.
+#[derive(Debug, Default)]
+pub struct Burst {
+    failures: u32,
+    reported: bool,
+}
+
+impl Burst {
+    /// Connected, kicked or a live link dropped: a new burst starts.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A connect attempt failed; true once per burst when it counts as given up.
+    pub fn failed(&mut self, fast: bool) -> bool {
+        self.failures += 1;
+        if self.reported || fast || self.failures < BURST_FAIL {
+            return false;
+        }
+        self.reported = true;
+        true
+    }
+}
 
 /// A failure the user has to act on.
 #[derive(Debug)]
@@ -82,6 +116,8 @@ pub struct Phone {
     cmds: mpsc::Sender<Request>,
     link: watch::Receiver<Link>,
     kick: Arc<Notify>,
+    events: broadcast::Sender<LinkEvent>,
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Phone {
@@ -89,8 +125,44 @@ impl Phone {
         let (cmds, rx) = mpsc::channel(8);
         let (tx, link) = watch::channel(Link::default());
         let kick = Arc::new(Notify::new());
-        tokio::spawn(run(addr, rx, tx, kick.clone()));
-        Self { cmds, link, kick }
+        let (events, _) = broadcast::channel(16);
+        let last_error = Arc::default();
+        tokio::spawn(run(
+            addr,
+            rx,
+            tx,
+            kick.clone(),
+            events.clone(),
+            Arc::clone(&last_error),
+        ));
+        Self {
+            cmds,
+            link,
+            kick,
+            events,
+            last_error,
+        }
+    }
+
+    pub fn events(&self) -> broadcast::Receiver<LinkEvent> {
+        self.events.subscribe()
+    }
+
+    /// Why the last connect attempt / link ended, if it did.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|e| e.clone())
+    }
+
+    /// Round trip of a ping over the control channel (until the next state frame).
+    pub async fn ping(&self, wait: Duration) -> Result<Duration> {
+        let mut rx = self.link.clone();
+        rx.mark_unchanged();
+        let start = Instant::now();
+        self.send(Cmd::Ping, wait).await?;
+        timeout(wait.saturating_sub(start.elapsed()), rx.changed())
+            .await
+            .map_err(|_| anyhow!("no answer to the ping within {wait:?}"))??;
+        Ok(start.elapsed())
     }
 
     /// After resume: reconnect now instead of finishing the retry backoff (tokio timers stand
@@ -133,7 +205,10 @@ async fn run(
     mut cmds: mpsc::Receiver<Request>,
     link: watch::Sender<Link>,
     kick: Arc<Notify>,
+    events: broadcast::Sender<LinkEvent>,
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
 ) {
+    let mut burst = Burst::default();
     let mut step = 0;
     let mut fast_until = Instant::now();
     let mut missing = 0;
@@ -141,7 +216,16 @@ async fn run(
     let mut channel = None;
     loop {
         let started = Instant::now();
-        let res = attempt(addr, &mut channel, &mut cmds, &link, &kick, &mut fast_until).await;
+        let res = attempt(
+            addr,
+            &mut channel,
+            &mut cmds,
+            &link,
+            &kick,
+            &mut fast_until,
+            &events,
+        )
+        .await;
         let was_connected = link.borrow().connected;
         let diagnosed = res
             .as_ref()
@@ -160,8 +244,17 @@ async fn run(
             problem,
             ..Default::default()
         });
-        if let Err(e) = res {
+        if let Err(e) = &res {
             warn!("phone link: {e:#}");
+            if let Ok(mut l) = last_error.lock() {
+                *l = Some(format!("{e:#}"));
+            }
+        }
+        if was_connected {
+            burst.reset();
+        } else if burst.failed(Instant::now() < fast_until) {
+            warn!("phone link: {BURST_FAIL}+ connects failed in a row, backing off");
+            let _ = events.send(LinkEvent::GaveUp);
         }
         // Commands queued while offline would be stale; fail them now.
         while let Ok((cmd, reply)) = cmds.try_recv() {
@@ -181,7 +274,8 @@ async fn run(
                 step = (step + 1).min(BACKOFF.len() - 1);
             },
             _ = kick.notified() => {
-                info!("phone link: reconnecting now (resume)");
+                info!("phone link: reconnecting now");
+                burst.reset();
                 step = 0;
                 fast_until = Instant::now() + FAST_WINDOW;
             }
@@ -197,6 +291,7 @@ async fn attempt(
     link: &watch::Sender<Link>,
     kick: &Notify,
     fast_until: &mut Instant,
+    events: &broadcast::Sender<LinkEvent>,
 ) -> Result<()> {
     let started = Instant::now();
     let (session, adapter) = call("open session", async {
@@ -285,6 +380,7 @@ async fn attempt(
         state: Some(state),
         problem: None,
     });
+    let _ = events.send(LinkEvent::Connected);
     info!(
         "phone connected: first state {} ms after RFCOMM connect ({} ms since connect start, {} ms \
          since attempt start): {state:?}",
@@ -423,5 +519,24 @@ async fn call<T, E: Into<anyhow::Error>>(
     match timeout(CALL, f).await {
         Ok(r) => r.map_err(Into::into).context(what.to_owned()),
         Err(_) => Err(anyhow!("{what}: bluetoothd not answering")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn burst_gives_up_once() {
+        let mut b = Burst::default();
+        assert!(!b.failed(false));
+        assert!(!b.failed(false));
+        assert!(b.failed(false));
+        assert!(!b.failed(false), "once per burst");
+        b.reset();
+        for _ in 0..5 {
+            assert!(!b.failed(true), "not inside the fast window after resume");
+        }
+        assert!(b.failed(false), "window over: counts");
     }
 }

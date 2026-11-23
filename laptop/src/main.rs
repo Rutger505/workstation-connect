@@ -5,10 +5,12 @@ mod ctl;
 mod daemon;
 mod kde;
 mod logic;
+mod logs;
 mod net;
 mod phone;
 mod proto;
 mod sdp;
+mod sigv4;
 mod update;
 
 use anyhow::Result;
@@ -48,6 +50,8 @@ enum Command {
     Screen,
     /// One-time kdeconnectd setup: notifications to phone, Bluetooth link, share folder.
     Setup,
+    /// Store the write-only key for log uploads (~/.config/workstation-connect/logs.env).
+    LogsKey { access: String, secret: String },
     /// Reinstall wsconnect from GitHub main (cargo install), restart the daemon.
     Update {
         /// Wait for Enter at the end (menu runs it in a fresh terminal).
@@ -78,6 +82,7 @@ async fn main() -> Result<()> {
         Command::Screen => actions::run(actions::Action::Screen, vec![]).await,
         Command::Setup => actions::setup().await,
         Command::Update { pause } => update::run(pause).await,
+        Command::LogsKey { access, secret } => logs::write_key(&access, &secret),
         cmd => {
             let req = match cmd {
                 Command::Pause => "pause",

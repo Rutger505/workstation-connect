@@ -2,9 +2,11 @@
 //! switches back to known Wi-Fi, turns everything off on sleep or pause.
 
 use crate::config::Config;
+use crate::kde::DeviceInfo;
 use crate::logic::{self, OfflineTimer};
+use crate::logs::{Reason, Uploader};
 use crate::net::{self, Nm, Snapshot};
-use crate::phone::{Link, Phone};
+use crate::phone::{Link, LinkEvent, Phone};
 use crate::proto::{self, Cmd};
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, pin_mut};
@@ -56,6 +58,7 @@ struct Ctx {
     epoch: AtomicU64,
     /// Bumped on every resume from suspend: offline timer and cooldown start over.
     resumes: watch::Sender<u64>,
+    uploader: Uploader,
 }
 
 impl Ctx {
@@ -140,7 +143,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         paused: watch::channel(false).0,
         epoch: AtomicU64::new(0),
         resumes: watch::channel(0).0,
+        uploader: Uploader::spawn(),
     });
+    info!("wsconnect {} started", crate::update::VERSION);
+    ctx.uploader.trigger(Reason::Start);
 
     // Mirror the phone link into the status.
     let c = ctx.clone();
@@ -158,9 +164,19 @@ pub async fn run(cfg: Config) -> Result<()> {
     let reconnected = Arc::new(tokio::sync::Notify::new());
     let r = reconnected.clone();
     let auto = ctx.cfg.auto_update;
+    let up = ctx.uploader.clone();
     tokio::spawn(async move {
-        crate::update::watch(auto, |u| c.set(|s| s.update = u), || {}, &r).await
+        crate::update::watch(
+            auto,
+            |u| c.set(|s| s.update = u),
+            || up.trigger(Reason::Update),
+            &r,
+        )
+        .await
     });
+    tokio::spawn(link_events(ctx.clone()));
+    tokio::spawn(periodic_upload(ctx.clone()));
+    tokio::spawn(kde_watch(ctx.clone()));
     tokio::spawn(reconnect_watch(ctx.clone(), reconnected));
     tokio::spawn(sleep_guard(ctx.clone()));
     tokio::spawn(wifi_guard(ctx.clone()));
@@ -170,8 +186,16 @@ pub async fn run(cfg: Config) -> Result<()> {
         idle(&ctx).await;
         let epoch = ctx.epoch();
         let result = match activate(&ctx, epoch).await {
-            Ok(()) => on_phone(&ctx, epoch).await,
-            Err(e) => Err(e),
+            Ok(()) => {
+                ctx.uploader.trigger(Reason::HotspotOk);
+                on_phone(&ctx, epoch).await
+            }
+            Err(e) => {
+                if !e.is::<Aborted>() {
+                    ctx.uploader.trigger(Reason::HotspotFail);
+                }
+                Err(e)
+            }
         };
         match result {
             Ok(()) => {}
@@ -410,6 +434,68 @@ async fn try_known_wifi(ctx: &Ctx, epoch: u64, id: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// Log upload after every phone link connect outcome.
+async fn link_events(ctx: Arc<Ctx>) {
+    let mut rx = ctx.phone.events();
+    loop {
+        match rx.recv().await {
+            Ok(LinkEvent::Connected) => ctx.uploader.trigger(Reason::LinkOk),
+            Ok(LinkEvent::GaveUp) => ctx.uploader.trigger(Reason::LinkFail),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// Log upload every 10 min while online (skipped without new lines).
+async fn periodic_upload(ctx: Arc<Ctx>) {
+    loop {
+        sleep(Duration::from_secs(10 * 60)).await;
+        if ctx.nm.snapshot().await.is_ok_and(|s| s.online) {
+            ctx.uploader.trigger(Reason::Periodic);
+        }
+    }
+}
+
+async fn kde_info(kde: &mut Option<crate::kde::Kde>, want: Option<&str>) -> Result<DeviceInfo> {
+    if kde.is_none() {
+        *kde = Some(crate::kde::Kde::connect().await?);
+    }
+    let k = kde.as_ref().expect("set above");
+    let id = k.find_phone(want).await?;
+    k.device_info(&id).await
+}
+
+/// Logs every change of the phone's KDE Connect device (reachable, link types, loaded plugins)
+/// and kdeconnectd D-Bus errors, for debugging input/notifications/clipboard from uploaded logs.
+async fn kde_watch(ctx: Arc<Ctx>) {
+    let want = ctx.cfg.kdeconnect_device.clone();
+    let mut kde = None;
+    let mut last: Option<DeviceInfo> = None;
+    let mut last_err: Option<String> = None;
+    loop {
+        match kde_info(&mut kde, want.as_deref()).await {
+            Ok(info) => {
+                for line in crate::kde::describe_change(last.as_ref(), &info) {
+                    info!("{line}");
+                }
+                last = Some(info);
+                last_err = None;
+            }
+            Err(e) => {
+                kde = None; // reconnect: bus or kdeconnectd restarted
+                let e = format!("{e:#}");
+                if last_err.as_ref() != Some(&e) {
+                    warn!("kde connect: {e}");
+                    last_err = Some(e);
+                }
+                last = None;
+            }
+        }
+        sleep(Duration::from_secs(15)).await;
+    }
+}
+
 /// Pokes the update check on every network (re)connect.
 async fn reconnect_watch(ctx: Arc<Ctx>, reconnected: Arc<tokio::sync::Notify>) {
     loop {
@@ -421,6 +507,7 @@ async fn reconnect_watch(ctx: Arc<Ctx>, reconnected: Arc<tokio::sync::Notify>) {
             while events.next().await.is_some() {
                 if start.elapsed() > Duration::from_secs(5) {
                     reconnected.notify_one();
+                    ctx.uploader.retry();
                 }
             }
             bail!("NM watch ended")

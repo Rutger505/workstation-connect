@@ -114,7 +114,26 @@ first state X ms after RFCOMM connect`. Status says connected only after the
 first state frame. Idle link: ping every 60 s (15 s to answer); after resume a ping with 5 s to
 answer, else reconnect (every 1 s for 20 s, then 2/5/10/30/60 s backoff).
 
-CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update`.
+**Log upload** (private S3 bucket `wsconnect-logs` on `https://cdn.rutgerpronk.com`, SeaweedFS,
+path-style, SigV4, region us-east-1): `wsconnect logs-key <access> <secret>` writes the write-only
+key to `~/.config/workstation-connect/logs.env` (mode 600, never in the repo; lines
+`WSCONNECT_LOGS_ACCESS_KEY=…`, `WSCONNECT_LOGS_SECRET_KEY=…`), used from the next upload on, no
+restart. No file: upload off (one info line).
+- Object: `laptop/<hostname>/<YYYY-MM-DD>/<HHMMSS>-<reason>.log` (UTC), text/plain. Header (host,
+  version, kernel, reason, time), then the user journal of `wsconnect`, `wsconnect-update` and
+  `app-org.kde.kdeconnect.daemon@*` since the last successful upload (cursor in
+  `~/.local/state/wsconnect/upload.cursor`; first time: last hour), plus best effort the system
+  journal of `bluetooth.service` and Bluetooth kernel lines (needs journal read access). Newest
+  ~1 MB.
+- Reasons: `start` (daemon start, so also after an update), `link-ok` / `link-fail` (phone link
+  connected / 3 connects failed in a row outside the 20 s after resume), `hotspot-ok` /
+  `hotspot-fail` (hotspot join outcome), `update` (auto-update failed), `periodic` (every 10 min
+  while online, only with new lines), `selftest`. Triggers within 5 s become one upload.
+- Failed upload: cursor stays, reason kept, retried at the next trigger or network reconnect.
+- The daemon logs KDE Connect changes (reachable, link types, loaded plugins, D-Bus errors) and its
+  own KDE Connect actions, so input/notification/clipboard problems show up there too.
+
+CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update | logs-key`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
 - `menu`: walker/fuzzel/wofi/rofi (dmenu mode), first found; override with `menu = [...]` in config.
 - `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,
