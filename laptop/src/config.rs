@@ -1,5 +1,6 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::path::PathBuf;
 
 /// ~/.config/workstation-connect/config.toml
@@ -8,14 +9,14 @@ use std::path::PathBuf;
 pub struct Config {
     /// Phone's Bluetooth identity address (bluetoothctl devices), e.g. "AA:BB:CC:DD:EE:FF".
     pub phone: String,
-    /// NetworkManager connection for the phone's Bluetooth tethering (PAN).
-    pub bt_connection: String,
-    /// After Bluetooth tethering, also bring up the phone's Wi-Fi hotspot and move there (faster,
-    /// costs phone battery). Default off: Bluetooth tethering only.
+    /// NetworkManager connection for the phone's Wi-Fi hotspot.
+    pub hotspot_connection: String,
+    /// Obsolete (Bluetooth tethering is gone): accepted so old configs still load, ignored.
     #[serde(default)]
-    pub hotspot: bool,
-    /// NetworkManager connection for the phone's Wi-Fi hotspot. Needed with `hotspot = true`.
-    pub hotspot_connection: Option<String>,
+    bt_connection: Option<IgnoredAny>,
+    /// Obsolete (the hotspot is always used): accepted so old configs still load, ignored.
+    #[serde(default)]
+    hotspot: Option<IgnoredAny>,
     /// Seconds offline before asking the phone while a saved Wi-Fi network is in range (NM's
     /// chance to join it). None in range: the phone is asked right away.
     #[serde(default = "default_offline_secs")]
@@ -52,21 +53,18 @@ impl Config {
         let path = dir().join("config.toml");
         let text =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: Self =
-            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-        if cfg.hotspot && cfg.hotspot_connection.is_none() {
-            bail!(
-                "{}: hotspot = true needs hotspot_connection",
-                path.display()
-            );
-        }
-        Ok(cfg)
+        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
     }
 
-    /// The hotspot connection, if configured (also when `hotspot` is off: a hotspot joined by
-    /// hand still counts as being on the phone).
-    pub fn hotspot_id(&self) -> Option<&str> {
-        self.hotspot_connection.as_deref()
+    /// Obsolete keys present in the file (ignored; worth a warning).
+    pub fn obsolete_keys(&self) -> Vec<&'static str> {
+        [
+            ("bt_connection", self.bt_connection.is_some()),
+            ("hotspot", self.hotspot.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(k, set)| set.then_some(k))
+        .collect()
     }
 }
 
@@ -78,11 +76,47 @@ mod tests {
     fn parses_minimal() {
         let c: Config = toml::from_str(
             r#"phone = "AA:BB:CC:DD:EE:FF"
-bt_connection = "Pixel 9 Network""#,
+hotspot_connection = "Pixel 9 hotspot""#,
         )
         .unwrap();
-        assert!(!c.hotspot && c.hotspot_id().is_none());
+        assert_eq!(c.hotspot_connection, "Pixel 9 hotspot");
         assert_eq!(c.offline_secs, 15);
         assert!(c.ignore_ssids.is_empty());
+        assert!(c.obsolete_keys().is_empty());
+    }
+
+    #[test]
+    fn accepts_obsolete_bt_keys() {
+        let c: Config = toml::from_str(
+            r#"phone = "AA:BB:CC:DD:EE:FF"
+bt_connection = "Pixel 9 BT"
+hotspot = true
+hotspot_connection = "Pixel 9 hotspot""#,
+        )
+        .unwrap();
+        assert_eq!(c.hotspot_connection, "Pixel 9 hotspot");
+        assert_eq!(c.obsolete_keys(), ["bt_connection", "hotspot"]);
+    }
+
+    #[test]
+    fn needs_hotspot_connection() {
+        let e = toml::from_str::<Config>(
+            r#"phone = "AA:BB:CC:DD:EE:FF"
+bt_connection = "Pixel 9 BT""#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("hotspot_connection"), "{e}");
+    }
+
+    #[test]
+    fn still_rejects_unknown_keys() {
+        assert!(
+            toml::from_str::<Config>(
+                r#"phone = "AA:BB:CC:DD:EE:FF"
+hotspot_connection = "x"
+typo = 1"#,
+            )
+            .is_err()
+        );
     }
 }

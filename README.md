@@ -14,23 +14,23 @@ Phone ↔ laptop link for a Pixel 9 and an Arch/Hyprland laptop.
 
 1. Laptop has no internet (no Wi-Fi, or Wi-Fi with captive portal/no internet). Wi-Fi scan: no saved
    network in range → ask the phone at once; else NetworkManager gets `offline_secs` (15 s).
-2. Daemon sends "on (Bluetooth only)" over BLE and joins the phone's Bluetooth tethering right away
-   (~1-2 Mbps). The phone's bt-pan interface only appears once the laptop connects, so no waiting
-   for its state.
-3. Only with `hotspot = true`: the phone starts the hotspot too; as soon as that's up traffic moves
-   there and Bluetooth tethering goes off. Open connections (Discord, Spotify, websockets) reconnect once.
+2. Daemon sends "on" over BLE; the phone starts its Wi-Fi hotspot. The daemon waits (≤20 s) for the
+   phone's hotspot flag and joins `hotspot_connection` (rescans + retries, ~45 s total). No hotspot:
+   phone off, 60 s cooldown, try again. Bluetooth tethering is gone (BT PAN on the MT7921 had 2-60 s
+   RTT): the hotspot is the only way online, BLE only carries on/off and state.
+3. Hotspot connection drops: phone off, back to step 1.
 4. Every 60 s the laptop checks for a saved Wi-Fi in range. Each one gets one try per session; if it
-   has internet the phone is turned off, otherwise back to Bluetooth (or the hotspot).
+   has internet the phone is turned off, otherwise back to the hotspot.
 5. Suspend or pause (waybar click): phone off. Laptop gone for 3 min (BLE lost): the phone turns
    itself off.
 
 BLE protocol (both sides: `Proto.kt` in the app, `proto.rs`), service `6f2b0001-3c1d-4e8a-9f41-7a5d2c9e0b10`:
-- `…0002` control, write, encrypted: `0` off, `1` on, `2` Bluetooth tethering off, `3` laptop's
-  Wi-Fi changed/dropped: drop KDE Connect LAN links to it (sent on every change away from a Wi-Fi
-  connection, only to version >= 2; else the dead TCP link stays "connected" ~15 min), `4` on,
-  Bluetooth tethering only (version >= 3; older phones get `1`)
-- `…0003` state, read/notify, encrypted: `[flags, battery %, signal 0-4|255, version]` (version 3),
-  flags: 1 Shizuku ready, 2 BT tethered, 4 hotspot on, 8 wanted, 16 last command failed
+- `…0002` control, write, encrypted: `0` off, `1` on (hotspot), `3` laptop's Wi-Fi changed/dropped:
+  drop KDE Connect LAN links to it (sent on every change away from a Wi-Fi connection, only to
+  version >= 2; else the dead TCP link stays "connected" ~15 min). `2` and `4` (Bluetooth tethering
+  off/only) retired, never reuse; phones < v4 still start Bluetooth tethering on `1`, harmless.
+- `…0003` state, read/notify, encrypted: `[flags, battery %, signal 0-4|255, version]` (version 4),
+  flags: 1 Shizuku ready, 4 hotspot on, 8 wanted, 16 last command failed (2, was BT tethered, unused)
 
 ## Setup
 
@@ -57,16 +57,15 @@ sudo systemctl restart bluetooth
 
 # pair once (phone: Settings → Connected devices → Pair new device)
 bluetoothctl pair <phone MAC> && bluetoothctl trust <phone MAC>
-# That bond is BR/EDR (tethering). The BLE link needs an LE bond too: the daemon pairs over LE by
+# That bond is BR/EDR (KDE Connect's Bluetooth link). The BLE link needs an LE bond too: the daemon pairs over LE by
 # itself on first start (journal shows a code, accept it on the phone).
 
-# Bluetooth tethering connection
-nmcli connection add type bluetooth con-name "Pixel 9 BT" bluetooth.bdaddr <phone MAC> \
-  bluetooth.type panu connection.autoconnect no
-
-# hotspot connection: turn the hotspot on by hand once (app: "Nu aanzetten"), then
+# hotspot connection (config: hotspot_connection, required): turn the hotspot on by hand once
+# (app: "Nu aanzetten"), then
 nmcli device wifi connect "<SSID>" password "<password>" name "Pixel 9 hotspot"
 nmcli connection modify "Pixel 9 hotspot" connection.autoconnect no
+# Old configs: `bt_connection` and `hotspot` are obsolete, ignored (daemon logs a warning); remove
+# them, and the old Bluetooth PAN connection: nmcli connection delete "Pixel 9 BT"
 
 # trackpad: kdeconnectd injects input via the RemoteDesktop portal, which xdg-desktop-portal-hyprland
 # lacks. Route it to luminous and whitelist only KDE Connect, so it skips luminous' permission

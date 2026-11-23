@@ -1,4 +1,5 @@
 //! BLE protocol, keep in sync with android/app/src/main/java/com/rutger/wsconnect/Proto.kt.
+//! v4: the phone does the Wi-Fi hotspot only (Bluetooth tethering is gone).
 
 use serde::Serialize;
 use uuid::{Uuid, uuid};
@@ -12,22 +13,18 @@ pub const STATE: Uuid = uuid!("6f2b0003-3c1d-4e8a-9f41-7a5d2c9e0b10");
 pub enum Cmd {
     Off = 0,
     On = 1,
-    BtOff = 2,
+    // 2 (was "Bluetooth tethering off") retired: never reuse.
     /// Laptop's Wi-Fi network changed or dropped: drop your KDE Connect LAN links to me.
     /// Only for phones reporting version >= 2 ([`NET_CHANGED_VERSION`]).
     NetChanged = 3,
-    /// Bluetooth tethering only, no hotspot. Only for phones reporting version >= 3
-    /// ([`BT_ONLY_VERSION`]); older ones get [`Cmd::On`].
-    OnBt = 4,
+    // 4 (was "on, Bluetooth tethering only") retired: never reuse.
 }
 
 /// First phone protocol version that understands [`Cmd::NetChanged`].
 pub const NET_CHANGED_VERSION: u8 = 2;
-/// First phone protocol version that understands [`Cmd::OnBt`].
-pub const BT_ONLY_VERSION: u8 = 3;
 
 const FLAG_SHIZUKU: u8 = 1;
-const FLAG_BT_TETHER: u8 = 2;
+// 2 (was "Bluetooth tethered") unused: never reuse.
 const FLAG_HOTSPOT: u8 = 4;
 const FLAG_WANTED: u8 = 8;
 const FLAG_ERROR: u8 = 16;
@@ -35,7 +32,6 @@ const FLAG_ERROR: u8 = 16;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PhoneState {
     pub shizuku: bool,
-    pub bt_tether: bool,
     pub hotspot: bool,
     pub wanted: bool,
     pub error: bool,
@@ -53,7 +49,6 @@ impl PhoneState {
         };
         Some(Self {
             shizuku: flags & FLAG_SHIZUKU != 0,
-            bt_tether: flags & FLAG_BT_TETHER != 0,
             hotspot: flags & FLAG_HOTSPOT != 0,
             wanted: flags & FLAG_WANTED != 0,
             error: flags & FLAG_ERROR != 0,
@@ -71,7 +66,10 @@ mod tests {
     #[test]
     fn parses_state() {
         let s = PhoneState::parse(&[1 | 4 | 8, 87, 3, 2]).unwrap();
-        assert!(s.shizuku && s.hotspot && s.wanted && !s.bt_tether && !s.error);
+        assert!(s.shizuku && s.hotspot && s.wanted && !s.error);
+        // Old phones may still set the retired BT flag: ignored.
+        let old = PhoneState::parse(&[1 | 2, 50, 2, 3]).unwrap();
+        assert!(old.shizuku && !old.hotspot && !old.wanted && !old.error);
         assert_eq!((s.battery, s.signal, s.version), (87, Some(3), 2));
         assert_eq!(PhoneState::parse(&[0, 50, 255, 1]).unwrap().signal, None);
         assert!(PhoneState::parse(&[0, 1]).is_none());

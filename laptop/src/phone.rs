@@ -209,8 +209,8 @@ async fn connect_and_serve(
     loop {
         tokio::select! {
             _ = le_check.tick() => {
-                // Only the LE bearer counts: Device1.Connected covers BR/EDR too (KDE Connect,
-                // tethering) and flips to false on BR/EDR changes while LE stays up.
+                // Only the LE bearer counts: Device1.Connected covers BR/EDR too (KDE Connect)
+                // and flips to false on BR/EDR changes while LE stays up.
                 // A failing/hanging read means bluetoothd lost the bearer or got stuck: reconnect.
                 if !call("LE state", le.connected()).await? {
                     bail!("LE link lost");

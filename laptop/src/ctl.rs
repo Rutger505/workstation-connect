@@ -139,7 +139,6 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     let icon = match mode {
         None => "󰄜",
         Some(Mode::Hotspot) => "󰀂",
-        Some(Mode::Bluetooth) => "󰂯",
         Some(Mode::Activating) => "󰑓",
         Some(Mode::Offline | Mode::Cooldown) => "󰖪",
         Some(Mode::Paused) => "󰏤",
@@ -225,7 +224,7 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
 
     let class = match mode {
         None => "down",
-        Some(Mode::Hotspot | Mode::Bluetooth) => "tethered",
+        Some(Mode::Hotspot) => "tethered",
         Some(Mode::Activating) => "activating",
         Some(Mode::Offline | Mode::Cooldown) => "offline",
         Some(Mode::Paused) => "paused",
@@ -254,7 +253,7 @@ mod tests {
     #[test]
     fn formats_hotspot() {
         let v = json!({"mode": "hotspot", "paused": false, "offline_secs": null, "error": null,
-            "phone": {"connected": true, "state": {"shizuku": true, "bt_tether": false, "hotspot": true,
+            "phone": {"connected": true, "state": {"shizuku": true, "hotspot": true,
             "wanted": true, "error": false, "battery": 81, "signal": 3}}});
         let w = format_waybar(Some(&v), &KdeView::Unknown);
         assert_eq!(w["text"], "󰀂 81% ▆");

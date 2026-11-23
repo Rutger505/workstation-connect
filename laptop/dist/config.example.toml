@@ -2,11 +2,8 @@
 
 # Phone's Bluetooth address: bluetoothctl devices
 phone = "AA:BB:CC:DD:EE:FF"
-# NetworkManager connection names (nmcli -f NAME,TYPE connection show)
-bt_connection = "Pixel 9 BT"
-# Also bring up the phone's Wi-Fi hotspot after Bluetooth (faster, costs phone battery); default off
-# hotspot = true
-# hotspot_connection = "Pixel 9 hotspot"
+# NetworkManager connection for the phone's Wi-Fi hotspot (nmcli -f NAME,TYPE connection show), required
+hotspot_connection = "Pixel 9 hotspot"
 # Seconds without internet before the phone is asked while a saved Wi-Fi is in range (none: at once)
 offline_secs = 15
 # Saved Wi-Fi never worth leaving the phone for
