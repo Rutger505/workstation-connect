@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-bluer = { version = "0.17", features = ["bluetoothd", "rfcomm"] }
+bluer = { version = "0.17", features = ["bluetoothd", "l2cap", "rfcomm"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

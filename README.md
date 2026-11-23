@@ -25,7 +25,9 @@ Phone ↔ laptop link for a Pixel 9 and an Arch/Hyprland laptop.
    itself off.
 
 Protocol v5 (both sides: `Proto.kt` in the app, `proto.rs`): classic Bluetooth (BR/EDR) RFCOMM,
-service UUID `6f2b0010-3c1d-4e8a-9f41-7a5d2c9e0b10`, SDP name "Workstation Connect", channel via SDP.
+service UUID `6f2b0010-3c1d-4e8a-9f41-7a5d2c9e0b10`, SDP name "Workstation Connect", channel via SDP
+(laptop does its own SDP lookup, cached until a connect fails; not BlueZ ConnectProfile, which
+browses a device once per bluetoothd run and then misses a service added later).
 The phone listens (secure, bonded devices only); the laptop pages the bonded phone and keeps the
 link up while awake, reconnecting when it drops. Several laptops may be connected at once.
 - Framing, both directions: `[len: u8][payload: len bytes]`; `len` 0 = keepalive, ignored.
@@ -98,8 +100,9 @@ tooltip shows `installed → latest`, class becomes `["<class>", "outdated"]`, m
 Phone not paired over classic Bluetooth (or bond lost): text gets `󰀦`, class `not-paired`; pair it
 in the Bluetooth menu. Phone paged fine but its RFCOMM service didn't answer 3 tries in a row (app
 not running / no Bluetooth permission): `󰀦`, class `service-missing`.
-Connect sequence in the journal (`phone link: …`): connecting (page + SDP + RFCOMM) → RFCOMM
-connected in Xs → `phone connected: first state after Xs`. Status says connected only after the
+Connect sequence in the journal (`phone link: …`): connecting → SDP: RFCOMM channel N in X ms
+(pages the phone; skipped with a cached channel) → RFCOMM connected in X ms → `phone connected:
+first state X ms after RFCOMM connect`. Status says connected only after the
 first state frame. Idle link: ping every 60 s (15 s to answer); after resume a ping with 5 s to
 answer, else reconnect (every 1 s for 20 s, then 2/5/10/30/60 s backoff).
 

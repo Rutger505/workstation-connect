@@ -7,6 +7,7 @@ mod logic;
 mod net;
 mod phone;
 mod proto;
+mod sdp;
 mod update;
 
 use anyhow::Result;

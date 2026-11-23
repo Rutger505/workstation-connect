@@ -1,15 +1,16 @@
 //! Classic Bluetooth link to the phone: keeps an RFCOMM socket open while awake (like earbuds),
 //! streams its state, sends commands.
 //!
-//! Connect: register a client profile for our service UUID and ConnectProfile the bonded phone;
-//! BlueZ pages it, finds the RFCOMM channel via SDP and hands us the socket (NewConnection).
+//! Connect: our own SDP lookup of the service's RFCOMM channel (pages the phone; see sdp.rs for
+//! why not BlueZ ConnectProfile), then a plain RFCOMM socket to it with auth + encryption. The
+//! channel is cached until a connect to it fails.
 
 use crate::proto::{self, Cmd, Decoder, PhoneState};
+use crate::sdp;
 use anyhow::{Context, Result, anyhow, bail};
 use bluer::rfcomm::stream::{OwnedReadHalf, OwnedWriteHalf};
-use bluer::rfcomm::{Profile, ProfileHandle, ReqError, Role, Stream};
+use bluer::rfcomm::{Security, SecurityLevel, Socket, SocketAddr, Stream};
 use bluer::{Address, ErrorKind, Session};
-use futures::{StreamExt, pin_mut};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,8 +39,10 @@ pub enum Problem {
 /// Any single D-Bus call to bluetoothd. bluer's own is 120 s: a bluetoothd that never answers
 /// (seen after resume from hibernate) hung the daemon silently.
 const CALL: Duration = Duration::from_secs(30);
-/// ConnectProfile: page + SDP + RFCOMM connect + handing us the socket.
-const CONNECT: Duration = Duration::from_secs(30);
+/// SDP lookup, including paging the phone.
+const SDP: Duration = Duration::from_secs(20);
+/// RFCOMM connect, including paging (cached channel) and link authentication.
+const CONNECT: Duration = Duration::from_secs(20);
 /// The phone sends its state right after accepting.
 const FIRST_STATE: Duration = Duration::from_secs(10);
 const WRITE: Duration = Duration::from_secs(10);
@@ -133,9 +136,11 @@ async fn run(
     let mut step = 0;
     let mut fast_until = Instant::now();
     let mut missing = 0;
+    // Phone's RFCOMM channel from the last SDP lookup; None: look it up.
+    let mut channel = None;
     loop {
         let started = Instant::now();
-        let res = attempt(addr, &mut cmds, &link, &kick, &mut fast_until).await;
+        let res = attempt(addr, &mut channel, &mut cmds, &link, &kick, &mut fast_until).await;
         let was_connected = link.borrow().connected;
         let diagnosed = res
             .as_ref()
@@ -186,6 +191,7 @@ async fn run(
 /// One connect + serve round; returns when the link is gone.
 async fn attempt(
     addr: Address,
+    channel: &mut Option<u8>,
     cmds: &mut mpsc::Receiver<Request>,
     link: &watch::Sender<Link>,
     kick: &Notify,
@@ -217,35 +223,44 @@ async fn attempt(
         }
         .into());
     }
-    // Dropping it unregisters the profile, which also closes the socket: keep it for the session.
-    let mut profile = call(
-        "register profile",
-        session.register_profile(Profile {
-            uuid: proto::SERVICE,
-            name: Some("Workstation Connect".into()),
-            role: Some(Role::Client),
-            require_authentication: Some(true),
-            require_authorization: Some(false),
-            // We decide when to connect.
-            auto_connect: Some(false),
-            ..Default::default()
-        }),
-    )
-    .await?;
+    drop((session, adapter, device));
 
-    info!("phone link: connecting to {addr} (page + SDP + RFCOMM)");
+    info!("phone link: connecting to {addr}");
     let connecting = Instant::now();
-    let stream = timeout(CONNECT, connect(&device, &mut profile, addr))
+    let ch = match *channel {
+        Some(ch) => {
+            info!("phone link: cached RFCOMM channel {ch}, skipping SDP");
+            ch
+        }
+        None => {
+            let t = Instant::now();
+            let ch = timeout(SDP, sdp::rfcomm_channel(addr, proto::SERVICE))
+                .await
+                .map_err(|_| anyhow!("SDP: no answer after {}s{UNREACHABLE}", SDP.as_secs()))?
+                .map_err(sdp_error)?;
+            info!(
+                "phone link: SDP: RFCOMM channel {ch} in {} ms",
+                t.elapsed().as_millis()
+            );
+            ch
+        }
+    };
+    // A failed connect may mean the app now listens elsewhere: look it up again next time.
+    *channel = None;
+    let t = Instant::now();
+    let stream = timeout(CONNECT, connect(addr, ch))
         .await
         .map_err(|_| {
             anyhow!(
-                "no connection after {}s (phone in range? Bluetooth on?)",
+                "RFCOMM connect: no answer after {}s{UNREACHABLE}",
                 CONNECT.as_secs()
             )
-        })??;
+        })?
+        .map_err(connect_error)?;
+    *channel = Some(ch);
     info!(
-        "phone link: RFCOMM connected in {:.1}s",
-        connecting.elapsed().as_secs_f32()
+        "phone link: RFCOMM connected (channel {ch}) in {} ms",
+        t.elapsed().as_millis()
     );
 
     let (mut rd, mut wr) = stream.into_split();
@@ -270,9 +285,11 @@ async fn attempt(
         problem: None,
     });
     info!(
-        "phone connected: first state after {:.1}s ({:.1}s since session start): {state:?}",
-        connecting.elapsed().as_secs_f32(),
-        started.elapsed().as_secs_f32()
+        "phone connected: first state {} ms after RFCOMM connect ({} ms since connect start, {} ms \
+         since attempt start): {state:?}",
+        t.elapsed().as_millis(),
+        connecting.elapsed().as_millis(),
+        started.elapsed().as_millis()
     );
 
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
@@ -318,71 +335,59 @@ async fn attempt(
     }
 }
 
-/// ConnectProfile and take the socket BlueZ hands to our profile meanwhile.
-async fn connect(
-    device: &bluer::Device,
-    profile: &mut ProfileHandle,
-    addr: Address,
-) -> Result<Stream> {
-    let connect = device.connect_profile(&proto::SERVICE);
-    pin_mut!(connect);
-    let mut connected = false;
-    let mut stream = None;
-    loop {
-        tokio::select! {
-            r = &mut connect, if !connected => {
-                r.map_err(connect_error)?;
-                connected = true;
-            }
-            req = profile.next(), if stream.is_none() => {
-                let req = req.context("bluetoothd dropped our profile")?;
-                if req.device() != addr {
-                    info!("phone link: rejecting RFCOMM connection from {}", req.device());
-                    req.reject(ReqError::Rejected);
-                    continue;
-                }
-                stream = Some(req.accept().context("accept RFCOMM connection")?);
-            }
-        }
-        if connected && let Some(s) = stream.take() {
-            return Ok(s);
-        }
-    }
+const UNREACHABLE: &str = " (phone in range? Bluetooth on?)";
+const NOT_LISTENING: &str = "phone in reach but the Workstation Connect app isn't listening (app running? Bluetooth permission?)";
+
+/// RFCOMM socket to the phone. Medium = authenticated (bonded) + encrypted link, which Android's
+/// secure listenUsingRfcommWithServiceRecord requires; High would also demand an MITM-protected
+/// key and fail on a Just Works bond.
+async fn connect(addr: Address, ch: u8) -> std::io::Result<Stream> {
+    let sock = Socket::new()?;
+    sock.set_security(Security {
+        level: SecurityLevel::Medium,
+        key_size: 0,
+    })?;
+    sock.connect(SocketAddr::new(addr, ch)).await
 }
 
-/// ConnectProfile's error, sorted into what the user can do about it. BlueZ's messages differ per
-/// version ("br-connection-refused" vs "Connection refused"), hence the loose matching.
-fn connect_error(e: bluer::Error) -> anyhow::Error {
-    let msg = e.message.to_lowercase();
-    if matches!(
-        e.kind,
-        ErrorKind::AuthenticationFailed | ErrorKind::AuthenticationRejected
-    ) || msg.contains("key-missing")
-        || msg.contains("key missing")
-    {
+/// SDP lookup's error: no record = app not listening; socket errors: most likely not reachable.
+fn sdp_error(e: anyhow::Error) -> anyhow::Error {
+    if e.is::<sdp::ServiceNotFound>() {
+        return Diagnosed {
+            problem: Problem::ServiceMissing,
+            msg: format!("SDP: {e}: {NOT_LISTENING}"),
+        }
+        .into();
+    }
+    if e.chain().any(|c| c.is::<std::io::Error>()) {
+        return anyhow!("{e:#}{UNREACHABLE}");
+    }
+    e
+}
+
+/// RFCOMM connect's error, sorted into what the user can do about it.
+fn connect_error(e: std::io::Error) -> anyhow::Error {
+    /// Linux EACCES: what the kernel makes of HCI "authentication failure" / "key missing".
+    const EACCES: i32 = 13;
+    if e.raw_os_error() == Some(EACCES) {
         return Diagnosed {
             problem: Problem::NotPaired,
             msg: format!(
-                "connect: {e}: bond lost? remove the phone in the Bluetooth menu and pair it again"
+                "RFCOMM connect: {e}: bond lost? remove the phone in the Bluetooth menu and pair \
+                 it again"
             ),
         }
         .into();
     }
-    // Paged fine, but SDP has no record of our service or nobody listens on its channel.
-    if e.kind == ErrorKind::NotAvailable
-        || msg.contains("profile-unavailable")
-        || msg.contains("refused")
-    {
+    // Paged fine, but nobody listens on the channel (app stopped, or moved to another channel).
+    if e.kind() == std::io::ErrorKind::ConnectionRefused {
         return Diagnosed {
             problem: Problem::ServiceMissing,
-            msg: format!(
-                "connect: {e}: phone in reach but the Workstation Connect app isn't listening \
-                 (app running? Bluetooth permission?)"
-            ),
+            msg: format!("RFCOMM connect: {e}: {NOT_LISTENING}"),
         }
         .into();
     }
-    anyhow!("connect: {e} (phone in range? Bluetooth on?)")
+    anyhow!("RFCOMM connect: {e}{UNREACHABLE}")
 }
 
 /// Next frame's payload (empty: keepalive). Cancel safe: only the read awaits.
