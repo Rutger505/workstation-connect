@@ -12,7 +12,7 @@ mod update;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Laptop side of workstation-connect: phone internet on demand over BLE.
+/// Laptop side of workstation-connect: phone internet on demand over Bluetooth.
 #[derive(Parser)]
 #[command(version = update::VERSION)]
 struct Cli {

@@ -2,12 +2,12 @@
 name = "wsconnect"
 version = "0.1.0"
 edition = "2024"
-description = "Laptop side of workstation-connect: phone hotspot on demand over BLE"
+description = "Laptop side of workstation-connect: phone hotspot on demand over Bluetooth"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
-bluer = { version = "0.17", features = ["bluetoothd"] }
+bluer = { version = "0.17", features = ["bluetoothd", "rfcomm"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

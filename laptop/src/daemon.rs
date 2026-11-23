@@ -431,7 +431,7 @@ async fn reconnect_watch(ctx: Arc<Ctx>, reconnected: Arc<tokio::sync::Notify>) {
 }
 
 /// The phone's KDE Connect keeps a dead TCP link "connected" for ~15 min after the laptop leaves
-/// its network; tell it over BLE whenever the Wi-Fi connection goes away.
+/// its network; tell it over Bluetooth whenever the Wi-Fi connection goes away.
 async fn wifi_guard(ctx: Arc<Ctx>) {
     loop {
         let res: Result<()> = async {

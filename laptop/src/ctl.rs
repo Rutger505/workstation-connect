@@ -46,7 +46,7 @@ async fn kde_view(kde: &mut Option<Kde>, want: Option<&str>) -> KdeView {
     }
 }
 
-/// Streams waybar JSON (return-type json) forever: daemon status (BLE/hotspot) merged with
+/// Streams waybar JSON (return-type json) forever: daemon status (Bluetooth link/hotspot) merged with
 /// KDE Connect (polled every 5 s). Survives daemon and kdeconnectd restarts.
 pub async fn waybar() -> Result<()> {
     let (daemon_tx, mut daemon_rx) = watch::channel::<Option<Value>>(None);
@@ -114,7 +114,7 @@ const BARS: [&str; 5] = ["▁", "▂", "▄", "▆", "█"];
 pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     let mode = daemon.and_then(mode_of);
     let phone = daemon.map(|v| &v["phone"]);
-    let ble = phone
+    let bt = phone
         .and_then(|p| p["connected"].as_bool())
         .unwrap_or(false);
     let state = phone.map(|p| &p["state"]);
@@ -123,14 +123,14 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
         _ => None,
     };
 
-    // BLE state is freshest when connected; KDE Connect covers the rest of the time.
+    // Bluetooth state is freshest when connected; KDE Connect covers the rest of the time.
     let battery = state
-        .filter(|_| ble)
+        .filter(|_| bt)
         .and_then(|s| s["battery"].as_u64())
         .map(|b| b as i64)
         .or_else(|| kp.and_then(|p| p.battery).map(i64::from));
     let signal = state
-        .filter(|_| ble)
+        .filter(|_| bt)
         .and_then(|s| s["signal"].as_u64())
         .filter(|s| *s <= 4)
         .map(|s| s as i64)
@@ -142,7 +142,7 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
         Some(Mode::Activating) => "󰑓",
         Some(Mode::Offline | Mode::Cooldown) => "󰖪",
         Some(Mode::Paused) => "󰏤",
-        Some(Mode::Idle) if kp.is_some() || ble => "󰄜",
+        Some(Mode::Idle) if kp.is_some() || bt => "󰄜",
         Some(Mode::Idle) => "󰥐",
     };
     let mut text = icon.to_string();
@@ -162,8 +162,8 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if update.is_some() {
         text.push_str(" 󰚰");
     }
-    let missing = phone.is_some_and(|p| p["service_missing"] == true);
-    if missing {
+    let problem = phone.and_then(|p| p["problem"].as_str());
+    if problem.is_some() {
         text.push_str(" 󰀦");
     }
 
@@ -178,20 +178,25 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
         None => tip.push("wsconnect daemon not running (auto hotspot off)".into()),
     }
     if daemon.is_some() {
-        tip.push(if ble {
+        tip.push(if bt {
             "bluetooth: phone in reach".into()
         } else {
             "bluetooth: phone not in reach".into()
         });
     }
-    if missing {
-        tip.push(
-            "phone in reach over LE but its workstation-connect service is missing: \
-             toggle Bluetooth off/on on the phone (app GATT server gone)"
+    match problem {
+        Some("not_paired") => {
+            tip.push("phone not paired over Bluetooth: pair it in the Bluetooth menu".into())
+        }
+        Some("service_missing") => tip.push(
+            "phone in reach but its workstation-connect service doesn't answer: \
+             app running? Bluetooth permission?"
                 .into(),
-        );
+        ),
+        Some(p) => tip.push(format!("bluetooth: {p}")),
+        None => {}
     }
-    if ble && state.is_some_and(|s| s["shizuku"] == false) {
+    if bt && state.is_some_and(|s| s["shizuku"] == false) {
         tip.push("Shizuku not running on phone".into());
     }
     match kde {
@@ -228,7 +233,7 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
         Some(Mode::Activating) => "activating",
         Some(Mode::Offline | Mode::Cooldown) => "offline",
         Some(Mode::Paused) => "paused",
-        Some(Mode::Idle) if !ble && kp.is_none() => "nophone",
+        Some(Mode::Idle) if !bt && kp.is_none() => "nophone",
         Some(Mode::Idle) => "idle",
     };
     // Plain string unless flagged, so existing CSS keeps matching.
@@ -236,8 +241,11 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if update.is_some() {
         classes.push("outdated");
     }
-    if missing {
-        classes.push("service-missing");
+    if let Some(p) = problem {
+        classes.push(match p {
+            "not_paired" => "not-paired",
+            _ => "service-missing",
+        });
     }
     let class = match classes[..] {
         [c] => json!(c),
@@ -295,7 +303,7 @@ mod tests {
     #[test]
     fn flags_service_missing() {
         let v = json!({"mode": "idle", "paused": false,
-            "phone": {"connected": false, "state": null, "service_missing": true}});
+            "phone": {"connected": false, "state": null, "problem": "service_missing"}});
         let w = format_waybar(Some(&v), &kde_phone(true));
         assert_eq!(w["text"], "󰄜 55% ▄ 󰀦");
         assert_eq!(w["class"], json!(["idle", "service-missing"]));
@@ -303,7 +311,17 @@ mod tests {
             w["tooltip"]
                 .as_str()
                 .unwrap()
-                .contains("service is missing")
+                .contains("service doesn't answer")
+        );
+        let v = json!({"mode": "idle", "paused": false,
+            "phone": {"connected": false, "state": null, "problem": "not_paired"}});
+        let w = format_waybar(Some(&v), &kde_phone(true));
+        assert_eq!(w["class"], json!(["idle", "not-paired"]));
+        assert!(
+            w["tooltip"]
+                .as_str()
+                .unwrap()
+                .contains("pair it in the Bluetooth menu")
         );
     }
 
