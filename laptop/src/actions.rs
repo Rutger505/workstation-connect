@@ -161,7 +161,8 @@ pub async fn menu() -> Result<()> {
         .await
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .is_some_and(|v| v["update"].is_object());
+        // Not while an auto-update runs (its lock would refuse anyway).
+        .is_some_and(|v| v["update"].is_object() && v["update"]["state"] != "updating");
     let mut actions = Action::MENU.to_vec();
     if outdated {
         actions.push(Action::Update);

@@ -28,6 +28,9 @@ pub struct Config {
     pub kdeconnect_device: Option<String>,
     /// Menu command reading entries on stdin (dmenu mode). Default: walker/fuzzel/wofi/rofi, first found.
     pub menu: Option<Vec<String>>,
+    /// Install updates of GitHub main right away (false: waybar marker + menu item only).
+    #[serde(default = "yes")]
+    pub auto_update: bool,
     /// Folder for files/photos shared from the phone (`wsconnect setup` applies it), e.g. "~/Pictures/Phone".
     pub share_dir: Option<String>,
 }
@@ -36,12 +39,26 @@ fn default_offline_secs() -> u64 {
     15
 }
 
+fn yes() -> bool {
+    true
+}
+
 pub fn xdg_config() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
         })
+}
+
+/// ~/.local/state/wsconnect: daemon state that survives restarts.
+pub fn state_dir() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+        })
+        .join("wsconnect")
 }
 
 pub fn dir() -> PathBuf {
@@ -82,6 +99,7 @@ hotspot_connection = "Pixel 9 hotspot""#,
         assert_eq!(c.hotspot_connection, "Pixel 9 hotspot");
         assert_eq!(c.offline_secs, 15);
         assert!(c.ignore_ssids.is_empty());
+        assert!(c.auto_update);
         assert!(c.obsolete_keys().is_empty());
     }
 

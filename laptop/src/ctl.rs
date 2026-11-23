@@ -157,7 +157,8 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
         .filter(|u| u.is_object())
         .map(|u| {
             let f = |k: &str| u[k].as_str().unwrap_or("?").to_string();
-            (f("installed"), f("latest"))
+            // Older daemons have no state: available.
+            (f("installed"), f("latest"), f("state"))
         });
     if update.is_some() {
         text.push_str(" 󰚰");
@@ -220,10 +221,20 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if let Some(e) = daemon.and_then(|v| v["error"].as_str()) {
         tip.push(format!("error: {e}"));
     }
-    if let Some((installed, latest)) = &update {
-        tip.push(format!(
-            "wsconnect update: {installed} → {latest} (wsconnect update)"
-        ));
+    if let Some((installed, latest, state)) = &update {
+        tip.push(match state.as_str() {
+            "updating" => format!(
+                "wsconnect updating: {installed} → {latest} (journalctl --user -u {})",
+                crate::update::UNIT
+            ),
+            "failed" => format!(
+                "wsconnect update {installed} → {latest} failed, auto retry within {} min \
+                 (journalctl --user -u {}; menu: Update wsconnect)",
+                crate::update::FAILED_BACKOFF.as_secs() / 60,
+                crate::update::UNIT
+            ),
+            _ => format!("wsconnect update: {installed} → {latest} (wsconnect update)"),
+        });
     }
     tip.push("click: pause/resume everything · right-click: menu".into());
 
@@ -238,8 +249,13 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     };
     // Plain string unless flagged, so existing CSS keeps matching.
     let mut classes = vec![class];
-    if update.is_some() {
+    if let Some((_, _, state)) = &update {
         classes.push("outdated");
+        match state.as_str() {
+            "updating" => classes.push("updating"),
+            "failed" => classes.push("update-failed"),
+            _ => {}
+        }
     }
     if let Some(p) = problem {
         classes.push(match p {
@@ -281,6 +297,20 @@ mod tests {
                 .unwrap()
                 .contains("wsconnect update: abc1234 → def5678 (wsconnect update)")
         );
+        v["update"]["state"] = json!("updating");
+        let w = format_waybar(Some(&v), &kde_phone(true));
+        assert_eq!(w["text"], "󰄜 55% ▄ 󰚰");
+        assert_eq!(w["class"], json!(["idle", "outdated", "updating"]));
+        assert!(
+            w["tooltip"]
+                .as_str()
+                .unwrap()
+                .contains("wsconnect updating: abc1234 → def5678")
+        );
+        v["update"]["state"] = json!("failed");
+        let w = format_waybar(Some(&v), &kde_phone(true));
+        assert_eq!(w["class"], json!(["idle", "outdated", "update-failed"]));
+        assert!(w["tooltip"].as_str().unwrap().contains("def5678 failed"));
         v["update"] = Value::Null;
         let w = format_waybar(Some(&v), &kde_phone(true));
         assert_eq!(w["text"], "󰄜 55% ▄");

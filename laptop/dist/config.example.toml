@@ -12,5 +12,7 @@ ignore_ssids = ["WiFi in de trein"]
 # kdeconnect_device = "Pixel 9"
 # Menu for `wsconnect menu` (default: walker/fuzzel/wofi/rofi, first found)
 # menu = ["fuzzel", "--dmenu"]
+# Install new versions from GitHub main right away (false: waybar marker + menu item)
+# auto_update = true
 # Folder for files/photos shared from the phone (applied by `wsconnect setup`)
 # share_dir = "~/Pictures/Phone"

@@ -157,7 +157,10 @@ pub async fn run(cfg: Config) -> Result<()> {
     let c = ctx.clone();
     let reconnected = Arc::new(tokio::sync::Notify::new());
     let r = reconnected.clone();
-    tokio::spawn(async move { crate::update::watch(|u| c.set(|s| s.update = u), &r).await });
+    let auto = ctx.cfg.auto_update;
+    tokio::spawn(async move {
+        crate::update::watch(auto, |u| c.set(|s| s.update = u), || {}, &r).await
+    });
     tokio::spawn(reconnect_watch(ctx.clone(), reconnected));
     tokio::spawn(sleep_guard(ctx.clone()));
     tokio::spawn(wifi_guard(ctx.clone()));

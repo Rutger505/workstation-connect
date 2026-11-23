@@ -94,9 +94,17 @@ journalctl --user -fu wsconnect
 ```
 Phone battery/signal come from the Bluetooth link when in reach, else from KDE Connect.
 CSS classes: `idle`, `nophone`, `offline`, `activating`, `tethered`, `paused`, `down`.
-Outdated install (GitHub main has newer `laptop/` commits; daemon checks every 15 min and on every network reconnect): text gets `󰚰`,
-tooltip shows `installed → latest`, class becomes `["<class>", "outdated"]`, menu gets
-**Update wsconnect**.
+Outdated install (GitHub main has newer `laptop/` commits): daemon checks every 5 min and on every
+network reconnect, via `git ls-remote` (no API quota); the GitHub compare API only for a main sha it
+hasn't seen yet (60 requests/h per IP). Text gets `󰚰`, tooltip shows `installed → latest`, class
+becomes `["<class>", "outdated"]`.
+- `auto_update = true` (default): installs at once, no click: `wsconnect update` in the transient
+  user unit `wsconnect-update` (`systemd-run --user`, outside the daemon's cgroup, since the update
+  restarts the daemon). Class adds `updating` meanwhile. Failed (daemon still alive afterwards):
+  class adds `update-failed`, that commit is retried after 30 min (a newer commit at once; state in
+  `~/.local/state/wsconnect/update.failed`), menu gets **Update wsconnect**. Log:
+  `journalctl --user -u wsconnect-update`.
+- `auto_update = false`: only the marker; menu gets **Update wsconnect**.
 Phone not paired over classic Bluetooth (or bond lost): text gets `󰀦`, class `not-paired`; pair it
 in the Bluetooth menu. Phone paged fine but its RFCOMM service didn't answer 3 tries in a row (app
 not running / no Bluetooth permission): `󰀦`, class `service-missing`.
@@ -112,7 +120,7 @@ CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | 
 - `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,
   else finds the phone via mDNS (same network). First time: `adb pair <ip:port> <code>`.
 - `browse`: mounts the phone over sftp (kdeconnectd) and opens it with xdg-open.
-- `update`: clones/fetches main into `~/.cache/wsconnect/src`, `cargo install --path … --force --locked --target-dir ~/.cache/wsconnect/target` (kept build cache: only changed crates recompile), checks the installed `--version` matches the fetched commit, then restarts the daemon if active. Menu runs it
+- `update`: clones/fetches main into `~/.cache/wsconnect/src`, `cargo install --path … --force --locked --target-dir ~/.cache/wsconnect/target` (kept build cache: only changed crates recompile), checks the installed `--version` matches the fetched commit, then restarts the daemon if active. One at a time (lock `~/.cache/wsconnect/update.lock`). Menu runs it
   via `xdg-terminal-exec`, else `$TERMINAL -e`. `--version` shows the build commit (`unknown`
   without git: no update check).
 
