@@ -8,6 +8,7 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bluer::l2cap::{SeqPacket, SocketAddr};
 use bluer::{Address, AddressType};
+use std::os::fd::AsRawFd;
 use uuid::Uuid;
 
 const PSM_SDP: u16 = 1;
@@ -40,6 +41,9 @@ impl std::error::Error for ServiceNotFound {}
 /// timeout.
 pub async fn rfcomm_channel(addr: Address, service: Uuid) -> Result<u8> {
     let sock = SeqPacket::connect(SocketAddr::new(addr, AddressType::BrEdr, PSM_SDP))
+        .await
+        .context("SDP connect")?;
+    crate::btsock::settled(sock.as_raw_fd())
         .await
         .context("SDP connect")?;
     let mut buf = vec![0u8; sock.recv_mtu().unwrap_or(0).max(672)];

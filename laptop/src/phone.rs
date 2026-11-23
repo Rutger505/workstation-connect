@@ -12,6 +12,7 @@ use bluer::rfcomm::stream::{OwnedReadHalf, OwnedWriteHalf};
 use bluer::rfcomm::{Security, SecurityLevel, Socket, SocketAddr, Stream};
 use bluer::{Address, ErrorKind, Session};
 use serde::Serialize;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -347,7 +348,9 @@ async fn connect(addr: Address, ch: u8) -> std::io::Result<Stream> {
         level: SecurityLevel::Medium,
         key_size: 0,
     })?;
-    sock.connect(SocketAddr::new(addr, ch)).await
+    let stream = sock.connect(SocketAddr::new(addr, ch)).await?;
+    crate::btsock::settled(stream.as_raw_fd()).await?;
+    Ok(stream)
 }
 
 /// SDP lookup's error: no record = app not listening; socket errors: most likely not reachable.

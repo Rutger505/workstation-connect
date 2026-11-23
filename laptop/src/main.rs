@@ -1,4 +1,5 @@
 mod actions;
+mod btsock;
 mod config;
 mod ctl;
 mod daemon;
