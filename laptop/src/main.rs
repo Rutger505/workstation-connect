@@ -10,6 +10,7 @@ mod net;
 mod phone;
 mod proto;
 mod sdp;
+mod selftest;
 mod sigv4;
 mod update;
 
@@ -50,6 +51,16 @@ enum Command {
     Screen,
     /// One-time kdeconnectd setup: notifications to phone, Bluetooth link, share folder.
     Setup,
+    /// Check daemon, phone link, hotspot and KDE Connect step by step; upload the report + logs
+    /// and hand it to Rocky (someclaw-thread).
+    Selftest {
+        /// Skip the hotspot test (turns the phone's hotspot on and off).
+        #[arg(long)]
+        no_hotspot: bool,
+        /// Don't hand the report to Rocky.
+        #[arg(long)]
+        no_send: bool,
+    },
     /// Store the write-only key for log uploads (~/.config/workstation-connect/logs.env).
     LogsKey { access: String, secret: String },
     /// Reinstall wsconnect from GitHub main (cargo install), restart the daemon.
@@ -82,6 +93,10 @@ async fn main() -> Result<()> {
         Command::Screen => actions::run(actions::Action::Screen, vec![]).await,
         Command::Setup => actions::setup().await,
         Command::Update { pause } => update::run(pause).await,
+        Command::Selftest {
+            no_hotspot,
+            no_send,
+        } => selftest::run(no_hotspot, no_send).await,
         Command::LogsKey { access, secret } => logs::write_key(&access, &secret),
         cmd => {
             let req = match cmd {

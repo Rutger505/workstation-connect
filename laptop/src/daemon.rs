@@ -8,6 +8,7 @@ use crate::logs::{Reason, Uploader};
 use crate::net::{self, Nm, Snapshot};
 use crate::phone::{Link, LinkEvent, Phone};
 use crate::proto::{self, Cmd};
+use crate::selftest::{Res, Step};
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, pin_mut};
 use serde::Serialize;
@@ -35,10 +36,14 @@ pub enum Mode {
     /// Failed; waiting before trying again.
     Cooldown,
     Paused,
+    /// `wsconnect selftest` holds the network (hotspot test); auto logic waits.
+    Selftest,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Status {
+    /// Running daemon's version (may differ from the installed CLI until restarted).
+    pub version: &'static str,
     pub mode: Mode,
     pub paused: bool,
     pub phone: Link,
@@ -54,6 +59,8 @@ struct Ctx {
     phone: Phone,
     status: watch::Sender<Status>,
     paused: watch::Sender<bool>,
+    /// Selftest's hotspot test runs: auto logic waits, running flows abort.
+    hold: watch::Sender<bool>,
     /// Bumped on pause and sleep: running flows see the change and bail out without side effects.
     epoch: AtomicU64,
     /// Bumped on every resume from suspend: offline timer and cooldown start over.
@@ -98,18 +105,18 @@ impl Ctx {
     }
 }
 
-/// Raised when a pause/sleep happened mid-flow.
+/// Raised when a pause/sleep/selftest happened mid-flow.
 #[derive(Debug)]
 struct Aborted;
 impl std::fmt::Display for Aborted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("aborted by pause/sleep")
+        f.write_str("aborted by pause/sleep/selftest")
     }
 }
 impl std::error::Error for Aborted {}
 
 fn check(ctx: &Ctx, epoch: u64) -> Result<()> {
-    if ctx.epoch() != epoch || *ctx.paused.borrow() {
+    if ctx.epoch() != epoch || *ctx.paused.borrow() || *ctx.hold.borrow() {
         bail!(Aborted);
     }
     Ok(())
@@ -128,6 +135,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         .with_context(|| format!("phone address {:?}", cfg.phone))?;
     let phone = Phone::spawn(addr);
     let (status, _) = watch::channel(Status {
+        version: crate::update::VERSION,
         mode: Mode::Idle,
         paused: false,
         phone: Link::default(),
@@ -141,6 +149,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         phone,
         status,
         paused: watch::channel(false).0,
+        hold: watch::channel(false).0,
         epoch: AtomicU64::new(0),
         resumes: watch::channel(0).0,
         uploader: Uploader::spawn(),
@@ -221,6 +230,15 @@ async fn idle(ctx: &Ctx) {
     let mut resumes = ctx.resumes.subscribe();
     let exclude = [ctx.cfg.hotspot_connection.as_str()];
     loop {
+        if *ctx.hold.borrow() {
+            ctx.set(|s| {
+                s.mode = Mode::Selftest;
+                s.offline_secs = None;
+            });
+            let _ = ctx.hold.subscribe().wait_for(|h| !h).await;
+            timer.reset();
+            continue;
+        }
         if *ctx.paused.borrow() {
             ctx.set(|s| {
                 s.mode = Mode::Paused;
@@ -230,7 +248,7 @@ async fn idle(ctx: &Ctx) {
             timer.reset();
         }
         sleep(Duration::from_secs(1)).await;
-        if *ctx.paused.borrow() {
+        if *ctx.paused.borrow() || *ctx.hold.borrow() {
             continue;
         }
         if resumes.has_changed().unwrap_or(false) {
@@ -663,6 +681,14 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut line = String::new();
     BufReader::new(r).read_line(&mut line).await?;
+    if line.trim_start().starts_with('{') {
+        let reply = match serde_json::from_str::<CtlReq>(line.trim()) {
+            Ok(req) => handle(&ctx, req).await,
+            Err(e) => serde_json::json!({"error": format!("bad request: {e}")}),
+        };
+        w.write_all(format!("{reply}\n").as_bytes()).await?;
+        return Ok(());
+    }
     let pause = |on: bool| {
         if on == *ctx.paused.borrow() {
             return;
@@ -710,5 +736,272 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
     }
     let s = serde_json::to_string(&*ctx.status.borrow())?;
     w.write_all(format!("{s}\n").as_bytes()).await?;
+    Ok(())
+}
+
+/// JSON requests on the ctl socket (one line, `{"cmd": …}`); answer: one JSON line, `{"error": …}`
+/// on failure.
+#[derive(serde::Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum CtlReq {
+    SelftestLink,
+    SelftestHotspot,
+    Upload {
+        reason: String,
+        #[serde(default)]
+        report: Option<String>,
+    },
+}
+
+async fn handle(ctx: &Arc<Ctx>, req: CtlReq) -> serde_json::Value {
+    use serde_json::json;
+    match req {
+        CtlReq::SelftestLink => json!({"steps": selftest_link(ctx).await}),
+        CtlReq::SelftestHotspot => json!({"steps": selftest_hotspot(ctx).await}),
+        CtlReq::Upload { reason, report } => match Reason::parse(&reason) {
+            None => json!({"error": format!("unknown reason {reason:?}")}),
+            Some(r) => match ctx.uploader.now(r, report).await {
+                Ok(key) => json!({"key": key}),
+                Err(e) => json!({"error": format!("{e:#}")}),
+            },
+        },
+    }
+}
+
+/// Selftest b: connect now if needed (timed), ping round trip, phone state.
+async fn selftest_link(ctx: &Ctx) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if ctx.phone.link().connected {
+        steps.push(Step::pass("connected", None, "already connected"));
+    } else {
+        info!("selftest: phone link not connected, connecting now");
+        let t = Instant::now();
+        ctx.phone.kick();
+        let mut rx = ctx.phone.watch();
+        let ok = tokio::time::timeout(Duration::from_secs(30), rx.wait_for(|l| l.connected))
+            .await
+            .is_ok_and(|r| r.is_ok());
+        if ok {
+            steps.push(Step::pass("connect now", Some(t), "connected"));
+        } else {
+            let link = ctx.phone.link();
+            let why = match (link.problem, ctx.phone.last_error()) {
+                (Some(p), e) => format!("{p:?}; last error: {}", e.unwrap_or_default()),
+                (None, Some(e)) => e,
+                (None, None) => "no error recorded".into(),
+            };
+            steps.push(Step::fail(
+                "connect now",
+                Some(t),
+                format!("not connected after 30 s: {why}"),
+            ));
+            return steps;
+        }
+    }
+    steps.push(match ctx.phone.ping(Duration::from_secs(5)).await {
+        Ok(rtt) => Step::new(
+            "ping round trip",
+            Res::Pass,
+            Some(rtt.as_millis() as u64),
+            "state frame back",
+        ),
+        Err(e) => Step::fail("ping round trip", None, format!("{e:#}")),
+    });
+    match ctx.phone.link().state {
+        Some(st) => {
+            let detail = format!(
+                "battery {}%, signal {}, app protocol v{}, Shizuku ready {}, hotspot on {}, \
+                 wanted {}, last command failed {}",
+                st.battery,
+                st.signal.map_or("unknown".into(), |s| format!("{s}/4")),
+                st.version,
+                st.shizuku,
+                st.hotspot,
+                st.wanted,
+                st.error
+            );
+            steps.push(if st.shizuku {
+                Step::pass("phone state", None, detail)
+            } else {
+                Step::fail(
+                    "phone state",
+                    None,
+                    format!("{detail}: Shizuku not running, the hotspot can't start"),
+                )
+            });
+        }
+        None => steps.push(Step::fail("phone state", None, "no state from the phone")),
+    }
+    steps
+}
+
+/// Selftest c, inside the daemon: holds the auto logic, turns the hotspot on, joins it, checks
+/// internet, turns it off and rejoins the previous Wi-Fi. Restores also on error/timeout.
+async fn selftest_hotspot(ctx: &Arc<Ctx>) -> Vec<Step> {
+    if ctx.hold.send_replace(true) {
+        return vec![Step::fail(
+            "hotspot test",
+            None,
+            "another selftest is running",
+        )];
+    }
+    info!("selftest: hotspot test, auto logic on hold");
+    ctx.abort_running();
+    ctx.mode(Mode::Selftest);
+    // Running flows notice the hold at their next check (≤1 s).
+    sleep(Duration::from_millis(1500)).await;
+    let hotspot = ctx.cfg.hotspot_connection.clone();
+    let mut steps = Vec::new();
+    let (was_on_hotspot, previous) = match ctx.nm.snapshot().await {
+        Ok(snap) => (
+            ctx.on_hotspot(&snap),
+            snap.active
+                .iter()
+                .find(|c| c.kind == "802-11-wireless" && c.id != hotspot)
+                .map(|c| c.id.clone()),
+        ),
+        Err(e) => {
+            steps.push(Step::fail("NetworkManager", None, format!("{e:#}")));
+            (false, None)
+        }
+    };
+    steps.push(Step::pass(
+        "before",
+        None,
+        match (&previous, was_on_hotspot) {
+            (_, true) => "on the hotspot already".to_string(),
+            (Some(p), _) => format!("Wi-Fi {p:?}"),
+            (None, _) => "no Wi-Fi".to_string(),
+        },
+    ));
+    let t = Instant::now();
+    if tokio::time::timeout(
+        Duration::from_secs(60),
+        hotspot_steps(ctx, &hotspot, was_on_hotspot, &mut steps),
+    )
+    .await
+    .is_err()
+    {
+        steps.push(Step::fail("hotspot test", Some(t), "timed out after 60 s"));
+    }
+    if was_on_hotspot {
+        steps.push(Step::skip("restore", "was on the hotspot before: left on"));
+    } else {
+        let t = Instant::now();
+        steps.push(Step::timed(
+            "phone off",
+            t,
+            ctx.phone
+                .send(Cmd::Off, Duration::from_secs(10))
+                .await
+                .map(|()| "sent".into()),
+        ));
+        let _ = net::down(&hotspot).await; // usually gone already with the phone's hotspot
+        match &previous {
+            Some(p) => {
+                let t = Instant::now();
+                steps.push(Step::timed(
+                    "restore",
+                    t,
+                    net::up(p, 20).await.map(|()| format!("back on {p:?}")),
+                ));
+            }
+            None => steps.push(Step::skip("restore", "no Wi-Fi before")),
+        }
+    }
+    ctx.hold.send_replace(false);
+    info!("selftest: hotspot test done, auto logic back");
+    steps
+}
+
+async fn hotspot_steps(ctx: &Ctx, hotspot: &str, already: bool, steps: &mut Vec<Step>) {
+    let on = Instant::now();
+    let r = ctx.phone.send(Cmd::On, Duration::from_secs(10)).await;
+    let failed = r.is_err();
+    steps.push(Step::timed("phone on", on, r.map(|()| "sent".into())));
+    if failed {
+        return;
+    }
+    let up = ctx
+        .phone
+        .wait_for(Duration::from_secs(20), |s| s.hotspot)
+        .await;
+    steps.push(if up {
+        Step::pass("phone reports hotspot up", Some(on), "since on")
+    } else {
+        Step::fail(
+            "phone reports hotspot up",
+            Some(on),
+            "no hotspot flag within 20 s",
+        )
+    });
+    info!(
+        "selftest: hotspot flag {up} after {} ms",
+        on.elapsed().as_millis()
+    );
+    if already {
+        steps.push(Step::skip("join hotspot", "already connected"));
+    } else {
+        let t = Instant::now();
+        let mut res = Err(anyhow::anyhow!("not tried"));
+        for attempt in 1..=3 {
+            res = net::up(hotspot, 10).await;
+            match &res {
+                Ok(()) => break,
+                Err(e) => warn!("selftest: hotspot up (attempt {attempt}): {e:#}"),
+            }
+            net::rescan().await;
+            sleep(Duration::from_secs(1)).await;
+        }
+        let failed = res.is_err();
+        steps.push(Step::timed(
+            "join hotspot",
+            t,
+            res.map(|()| format!("{hotspot:?} up")),
+        ));
+        if failed {
+            return;
+        }
+    }
+    let t = Instant::now();
+    let mut last = anyhow::anyhow!("not tried");
+    loop {
+        match tokio::task::spawn_blocking(internet_check).await {
+            Ok(Ok(())) => {
+                steps.push(Step::pass("internet", Some(t), format!("GET {CHECK_URL}")));
+                break;
+            }
+            Ok(Err(e)) => last = e,
+            Err(e) => last = e.into(),
+        }
+        if t.elapsed() > Duration::from_secs(15) {
+            steps.push(Step::fail("internet", Some(t), format!("{last:#}")));
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    info!(
+        "selftest: internet check done after {} ms",
+        t.elapsed().as_millis()
+    );
+}
+
+/// Arch's NetworkManager connectivity check.
+const CHECK_URL: &str = "http://ping.archlinux.org/nm-check.txt";
+
+fn internet_check() -> Result<()> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .into();
+    let body = agent
+        .get(CHECK_URL)
+        .call()
+        .with_context(|| format!("GET {CHECK_URL}"))?
+        .body_mut()
+        .read_to_string()?;
+    if !body.contains("NetworkManager is online") {
+        bail!("GET {CHECK_URL}: unexpected answer (captive portal?)");
+    }
     Ok(())
 }

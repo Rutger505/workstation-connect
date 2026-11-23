@@ -139,7 +139,7 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     let icon = match mode {
         None => "󰄜",
         Some(Mode::Hotspot) => "󰀂",
-        Some(Mode::Activating) => "󰑓",
+        Some(Mode::Activating | Mode::Selftest) => "󰑓",
         Some(Mode::Offline | Mode::Cooldown) => "󰖪",
         Some(Mode::Paused) => "󰏤",
         Some(Mode::Idle) if kp.is_some() || bt => "󰄜",
@@ -241,7 +241,7 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     let class = match mode {
         None => "down",
         Some(Mode::Hotspot) => "tethered",
-        Some(Mode::Activating) => "activating",
+        Some(Mode::Activating | Mode::Selftest) => "activating",
         Some(Mode::Offline | Mode::Cooldown) => "offline",
         Some(Mode::Paused) => "paused",
         Some(Mode::Idle) if !bt && kp.is_none() => "nophone",

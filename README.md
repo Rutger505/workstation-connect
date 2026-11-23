@@ -93,7 +93,7 @@ journalctl --user -fu wsconnect
 }
 ```
 Phone battery/signal come from the Bluetooth link when in reach, else from KDE Connect.
-CSS classes: `idle`, `nophone`, `offline`, `activating`, `tethered`, `paused`, `down`.
+CSS classes: `idle`, `nophone`, `offline`, `activating` (also during a selftest), `tethered`, `paused`, `down`.
 Outdated install (GitHub main has newer `laptop/` commits): daemon checks every 5 min and on every
 network reconnect, via `git ls-remote` (no API quota); the GitHub compare API only for a main sha it
 hasn't seen yet (60 requests/h per IP). Text gets `󰚰`, tooltip shows `installed → latest`, class
@@ -133,7 +133,30 @@ restart. No file: upload off (one info line).
 - The daemon logs KDE Connect changes (reachable, link types, loaded plugins, D-Bus errors) and its
   own KDE Connect actions, so input/notification/clipboard problems show up there too.
 
-CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update | logs-key`.
+**Selftest**: `wsconnect selftest [--no-hotspot] [--no-send]` prints PASS/FAIL/SKIP per step with
+timings (exit code 1 on any FAIL):
+- a. versions (CLI, daemon, phone app protocol), daemon reachable, up to date, config,
+  `hotspot_connection` in NetworkManager, `logs.env`.
+- b. phone link (in the daemon): connects now if needed (timed), ping round trip over RFCOMM, phone
+  state (battery, signal, Shizuku, hotspot flags).
+- c. hotspot (in the daemon, auto logic on hold, mode `selftest`, waybar class `activating`; ≤60 s +
+  restore): phone on → hotspot flag → join `hotspot_connection` → GET
+  `http://ping.archlinux.org/nm-check.txt` → phone off → previous Wi-Fi back (also on error/timeout).
+  Already on the hotspot: left on.
+- d. KDE Connect: kdeconnectd on D-Bus, phone device, paired, reachable + link types, key plugins
+  (mousepad, remotekeyboard, remotecontrol, notifications, sendnotifications, clipboard, ping),
+  trackpad portal config, KDE Connect ping to the phone. D-Bus errors verbatim.
+- Then: report + logs uploaded (reason `selftest`), report handed to Rocky with
+  `someclaw-thread send new -` (dev-env); prints the thread URL. Fails: says so, report stays in
+  the bucket.
+
+Daemon socket `$XDG_RUNTIME_DIR/wsconnect.sock`, one request line, one JSON answer line:
+`status | pause | resume | toggle`, `watch` (status line on every change), or JSON
+`{"cmd": "selftest_link"}`, `{"cmd": "selftest_hotspot"}` (→ `{"steps": [{name, res, ms, detail}]}`),
+`{"cmd": "upload", "reason": "<reason>", "report": "…"}` (→ `{"key": …}`, null when upload off);
+errors `{"error": "…"}`. Status has `version` (the running daemon's).
+
+CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update | logs-key | selftest`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
 - `menu`: walker/fuzzel/wofi/rofi (dmenu mode), first found; override with `menu = [...]` in config.
 - `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,
