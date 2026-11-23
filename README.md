@@ -63,7 +63,7 @@ bluetoothctl pair <phone MAC> && bluetoothctl trust <phone MAC>
 # hotspot connection (config: hotspot_connection, required): turn the hotspot on by hand once
 # (app: "Nu aanzetten"), then
 nmcli device wifi connect "<SSID>" password "<password>" name "Pixel 9 hotspot"
-nmcli connection modify "Pixel 9 hotspot" connection.autoconnect no
+nmcli connection modify "Pixel 9 hotspot" connection.autoconnect no 802-11-wireless.hidden yes  # daemon sets hidden itself too: probes the SSID, no waiting for a scan
 # Old configs: `bt_connection` and `hotspot` are obsolete, ignored (daemon logs a warning); remove
 # them, and the old Bluetooth PAN connection: nmcli connection delete "Pixel 9 BT"
 

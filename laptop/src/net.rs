@@ -211,6 +211,39 @@ pub async fn up(id: &str, wait_secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// Marks the hotspot connection hidden: NetworkManager then probes for its SSID instead of
+/// waiting until a scan lists it (after resume the scan cache is stale: seconds lost).
+pub async fn ensure_hidden(id: &str) -> Result<()> {
+    let out = nmcli(
+        &[
+            "-g",
+            "802-11-wireless.hidden",
+            "connection",
+            "show",
+            "id",
+            id,
+        ],
+        Duration::from_secs(10),
+    )
+    .await?;
+    if out.trim() != "yes" {
+        nmcli(
+            &[
+                "connection",
+                "modify",
+                "id",
+                id,
+                "802-11-wireless.hidden",
+                "yes",
+            ],
+            Duration::from_secs(10),
+        )
+        .await?;
+        tracing::info!("{id}: set 802-11-wireless.hidden yes (faster connect)");
+    }
+    Ok(())
+}
+
 pub async fn rescan() {
     let _ = nmcli(&["device", "wifi", "rescan"], Duration::from_secs(10)).await;
 }

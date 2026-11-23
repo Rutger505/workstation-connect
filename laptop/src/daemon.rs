@@ -116,6 +116,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     for key in cfg.obsolete_keys() {
         warn!("config: `{key}` is obsolete (Bluetooth tethering is gone), ignored: remove it");
     }
+    if let Err(e) = net::ensure_hidden(&cfg.hotspot_connection).await {
+        warn!("hotspot connection: {e:#}");
+    }
     let addr = cfg
         .phone
         .parse()
@@ -312,18 +315,34 @@ async fn drop_dead_wifi(snap: &Snapshot) {
 /// Waits (≤20 s) for the phone's hotspot flag, then joins, rescanning between tries.
 async fn try_hotspot(ctx: &Ctx, epoch: u64, within: Duration) -> Result<bool> {
     let hotspot = ctx.cfg.hotspot_connection.as_str();
-    let deadline = Instant::now() + within;
+    let start = Instant::now();
+    let deadline = start + within;
+    // The phone's hotspot is up ~3 s after "on". The connection probes its SSID directly
+    // (hidden = yes), so no waiting for a scan that lists it.
     ctx.phone
-        .wait_for(Duration::from_secs(20), |s| s.hotspot)
+        .wait_for(Duration::from_secs(10), |s| s.hotspot)
         .await;
-    while Instant::now() < deadline {
+    info!(
+        "phone hotspot flag after {:.1}s",
+        start.elapsed().as_secs_f32()
+    );
+    for attempt in 1.. {
         check(ctx, epoch)?;
-        match net::up(hotspot, 15).await {
-            Ok(()) => return Ok(true),
+        match net::up(hotspot, 10).await {
+            Ok(()) => {
+                info!(
+                    "hotspot up (attempt {attempt}, {:.1}s after on)",
+                    start.elapsed().as_secs_f32()
+                );
+                return Ok(true);
+            }
             Err(e) => {
-                warn!("hotspot up: {e:#}");
+                warn!("hotspot up (attempt {attempt}): {e:#}");
+                if Instant::now() >= deadline {
+                    break;
+                }
                 net::rescan().await;
-                sleep(Duration::from_secs(3)).await;
+                sleep(Duration::from_secs(1)).await;
             }
         }
     }
