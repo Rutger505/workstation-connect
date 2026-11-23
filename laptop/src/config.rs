@@ -31,7 +31,7 @@ pub struct Config {
     /// Install updates of GitHub main right away (false: waybar marker + menu item only).
     #[serde(default = "yes")]
     pub auto_update: bool,
-    /// Folder for files/photos shared from the phone (`wsconnect setup` applies it), e.g. "~/Pictures/Phone".
+    /// Folder for files/photos shared from the phone (`workstation-connect setup` applies it), e.g. "~/Pictures/Phone".
     pub share_dir: Option<String>,
 }
 
@@ -51,14 +51,14 @@ pub fn xdg_config() -> PathBuf {
         })
 }
 
-/// ~/.local/state/wsconnect: daemon state that survives restarts.
+/// ~/.local/state/workstation-connect: daemon state that survives restarts.
 pub fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
         })
-        .join("wsconnect")
+        .join("workstation-connect")
 }
 
 pub fn dir() -> PathBuf {

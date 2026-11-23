@@ -1,4 +1,4 @@
-//! `wsconnect selftest`: step-by-step check of daemon, phone link, hotspot and KDE Connect with
+//! `workstation-connect selftest`: step-by-step check of daemon, phone link, hotspot and KDE Connect with
 //! timings. Phone link + hotspot run inside the daemon (ctl socket) so they don't fight its state
 //! machine. Afterwards: report + logs to the bucket, report handed to Rocky via someclaw-thread.
 
@@ -138,7 +138,7 @@ async fn section_basics(
     cfg_err: &str,
     status: &mut Option<Value>,
 ) -> Vec<Step> {
-    let mut steps = vec![Step::pass("wsconnect", None, VERSION)];
+    let mut steps = vec![Step::pass("workstation-connect", None, VERSION)];
     let t = Instant::now();
     match crate::ctl::request("status")
         .await
@@ -157,7 +157,7 @@ async fn section_basics(
                 steps.push(Step::fail(
                     "daemon version",
                     None,
-                    format!("daemon runs {dv}, installed is {VERSION}: systemctl --user restart wsconnect"),
+                    format!("daemon runs {dv}, installed is {VERSION}: systemctl --user restart workstation-connect"),
                 ));
             }
             match v["update"]["state"].as_str() {
@@ -219,7 +219,7 @@ async fn section_basics(
             "logs.env",
             None,
             format!(
-                "{} missing: log upload off (wsconnect logs-key <access> <secret>)",
+                "{} missing: log upload off (workstation-connect logs-key <access> <secret>)",
                 env.display()
             ),
         ),
@@ -309,7 +309,7 @@ async fn section_kde(want: Option<&str>) -> Vec<Step> {
             t,
             kde.ping(
                 &id,
-                &format!("wsconnect selftest from {}", logs::hostname()),
+                &format!("workstation-connect selftest from {}", logs::hostname()),
             )
             .await
             .map(|()| "sent: it should show on the phone".to_string()),
@@ -440,7 +440,7 @@ pub async fn run(no_hotspot: bool, no_send: bool) -> Result<()> {
         .as_secs();
     let report = render(
         &format!(
-            "wsconnect selftest on {host}, {} ({})",
+            "workstation-connect selftest on {host}, {} ({})",
             VERSION,
             logs::amz_date(secs)
         ),
@@ -473,7 +473,7 @@ pub async fn run(no_hotspot: bool, no_send: bool) -> Result<()> {
             format!("logs: s3://wsconnect-logs/{k}")
         });
         let text = format!(
-            "wsconnect selftest from {host}: please analyse and fix failures ({where_})\n\n{report}"
+            "workstation-connect selftest from {host}: please analyse and fix failures ({where_})\n\n{report}"
         );
         match send_to_rocky(&text).await {
             Ok(out) => {

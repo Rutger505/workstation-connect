@@ -36,7 +36,7 @@ pub enum Mode {
     /// Failed; waiting before trying again.
     Cooldown,
     Paused,
-    /// `wsconnect selftest` holds the network (hotspot test); auto logic waits.
+    /// `workstation-connect selftest` holds the network (hotspot test); auto logic waits.
     Selftest,
 }
 
@@ -49,7 +49,7 @@ pub struct Status {
     pub phone: Link,
     pub offline_secs: Option<u64>,
     pub error: Option<String>,
-    /// Only when the installed wsconnect is behind GitHub main.
+    /// Only when the installed workstation-connect is behind GitHub main.
     pub update: Option<crate::update::Update>,
 }
 
@@ -154,7 +154,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         resumes: watch::channel(0).0,
         uploader: Uploader::spawn(),
     });
-    info!("wsconnect {} started", crate::update::VERSION);
+    info!("workstation-connect {} started", crate::update::VERSION);
     ctx.uploader.trigger(Reason::Start);
 
     // Mirror the phone link into the status.
@@ -616,7 +616,12 @@ async fn sleep_guard(ctx: Arc<Ctx>) {
         let mut signals = login.receive_prepare_for_sleep().await?;
         let mut lock = Some(
             login
-                .inhibit("sleep", "wsconnect", "turn the phone hotspot off", "delay")
+                .inhibit(
+                    "sleep",
+                    "workstation-connect",
+                    "turn the phone hotspot off",
+                    "delay",
+                )
                 .await?,
         );
         while let Some(sig) = signals.next().await {
@@ -637,7 +642,12 @@ async fn sleep_guard(ctx: Arc<Ctx>) {
             if !sig.args()?.start && lock.is_none() {
                 lock = Some(
                     login
-                        .inhibit("sleep", "wsconnect", "turn the phone hotspot off", "delay")
+                        .inhibit(
+                            "sleep",
+                            "workstation-connect",
+                            "turn the phone hotspot off",
+                            "delay",
+                        )
                         .await?,
                 );
             }
@@ -654,7 +664,7 @@ pub fn socket_path() -> std::path::PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("wsconnect.sock")
+        .join("workstation-connect.sock")
 }
 
 async fn serve_socket(ctx: Arc<Ctx>) {

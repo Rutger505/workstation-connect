@@ -1,8 +1,8 @@
-//! Outdated-install check + auto-update (daemon) and `wsconnect update` (CLI).
+//! Outdated-install check + auto-update (daemon) and `workstation-connect update` (CLI).
 //! Installed = commit embedded by build.rs; latest = GitHub main. Only laptop/ changes count.
 //! Check: `git ls-remote` for main's sha (no API quota), GitHub compare API only for a sha not
 //! seen before (60 requests/h unauthenticated, shared per IP).
-//! Auto-update: `wsconnect update` in its own transient unit (`systemd-run --user`), outside the
+//! Auto-update: `workstation-connect update` in its own transient unit (`systemd-run --user`), outside the
 //! daemon's cgroup: the update restarts the daemon unit, which would kill a child of it.
 
 use anyhow::{Context, Result, bail};
@@ -31,7 +31,7 @@ const RETRY: Duration = Duration::from_secs(5 * 60);
 /// A failed auto-update of a commit isn't retried for that commit within this time.
 pub const FAILED_BACKOFF: Duration = Duration::from_secs(30 * 60);
 /// Transient unit running the auto-update.
-pub const UNIT: &str = "wsconnect-update";
+pub const UNIT: &str = "workstation-connect-update";
 /// Poll interval while the update unit runs; give up (stop it) after MAX_UPDATE.
 const UPDATE_POLL: Duration = Duration::from_secs(5);
 const MAX_UPDATE: Duration = Duration::from_secs(60 * 60);
@@ -52,9 +52,9 @@ pub struct Update {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateState {
-    /// Waiting for a manual `wsconnect update` (auto_update = false).
+    /// Waiting for a manual `workstation-connect update` (auto_update = false).
     Available,
-    /// Auto-update running (unit wsconnect-update).
+    /// Auto-update running (unit workstation-connect-update).
     Updating,
     /// Auto-update of `latest` failed; retried after FAILED_BACKOFF (or a newer commit).
     Failed,
@@ -126,7 +126,7 @@ async fn latest_main() -> Result<String> {
 fn compare_blocking(installed: &str, latest: &str) -> Result<bool> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
-        .user_agent(concat!("wsconnect/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("workstation-connect/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
     let compare: Value = serde_json::from_str(&get(
@@ -137,7 +137,7 @@ fn compare_blocking(installed: &str, latest: &str) -> Result<bool> {
     Ok(outdated(&compare))
 }
 
-/// A failed auto-update, kept in ~/.local/state/wsconnect/update.failed ("<sha> <unix secs>")
+/// A failed auto-update, kept in ~/.local/state/workstation-connect/update.failed ("<sha> <unix secs>")
 /// so a daemon restart doesn't retry it right away.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Failed {
@@ -191,7 +191,7 @@ pub fn may_install(target: &str, failed: Option<&Failed>, now: SystemTime) -> bo
 
 /// The running binary; after `cargo install` replaced it, /proc reports "<path> (deleted)".
 fn current_exe() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| "wsconnect".into());
+    let exe = std::env::current_exe().unwrap_or_else(|_| "workstation-connect".into());
     match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
         Some(s) => s.into(),
         None => exe,
@@ -206,11 +206,11 @@ async fn unit_active() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Starts `wsconnect update` as transient user unit; returns once queued.
+/// Starts `workstation-connect update` as transient user unit; returns once queued.
 async fn start_unit() -> Result<()> {
     let mut cmd = Command::new("systemd-run");
     cmd.args(["--user", "--unit", UNIT, "--collect", "--quiet"])
-        .arg("--description=wsconnect auto-update");
+        .arg("--description=workstation-connect auto-update");
     // The user manager's environment may lack the toolchain the daemon was started with.
     for var in ["PATH", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
         if std::env::var_os(var).is_some() {
@@ -256,7 +256,7 @@ async fn wait_unit() -> Result<()> {
 /// Daemon task: reports the outdated state on every successful check (None: up to date).
 /// Errors keep the old result. Never runs for builds without a known commit. `reconnected` =
 /// check now (after a short settle), on top of the fixed interval. `auto`: install right away
-/// in unit wsconnect-update; `on_failed` runs after a failed auto-update.
+/// in unit workstation-connect-update; `on_failed` runs after a failed auto-update.
 pub async fn watch(
     auto: bool,
     report: impl Fn(Option<Update>),
@@ -306,7 +306,7 @@ pub async fn watch(
         };
         let wait = match res {
             Ok((_, false)) => {
-                debug!("wsconnect up to date ({COMMIT_SHORT})");
+                debug!("workstation-connect up to date ({COMMIT_SHORT})");
                 report(None);
                 EVERY
             }
@@ -371,7 +371,7 @@ pub async fn watch(
     }
 }
 
-/// `wsconnect update`: reinstall from main, restart the daemon if it runs.
+/// `workstation-connect update`: reinstall from main, restart the daemon if it runs.
 pub async fn run(pause: bool) -> Result<()> {
     let r = install().await;
     if let Err(e) = &r {
@@ -386,8 +386,8 @@ pub async fn run(pause: bool) -> Result<()> {
     r
 }
 
-/// Persistent clone + build dir under ~/.cache/wsconnect. `cargo install --git` with a kept
-/// target dir reused the old wsconnect build after a new commit (git sources aren't fingerprinted
+/// Persistent clone + build dir under ~/.cache/workstation-connect. `cargo install --git` with a kept
+/// target dir reused the old workstation-connect build after a new commit (git sources aren't fingerprinted
 /// by content), so update builds a local clone with `--path`: mtime fingerprints catch every change.
 /// Safe to delete (next update is a full build again).
 fn cache_dir() -> std::path::PathBuf {
@@ -396,7 +396,7 @@ fn cache_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| {
             std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")
         })
-        .join("wsconnect")
+        .join("workstation-connect")
 }
 
 async fn run_ok(cmd: &mut Command, what: &str) -> Result<()> {
@@ -435,7 +435,10 @@ fn lock(cache: &std::path::Path) -> Result<std::fs::File> {
     let f = std::fs::File::create(&path).with_context(|| format!("open {}", path.display()))?;
     // SAFETY: plain flock on an fd we own; released when the file closes.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("another wsconnect update is running ({})", path.display());
+        bail!(
+            "another workstation-connect update is running ({})",
+            path.display()
+        );
     }
     Ok(f)
 }
@@ -490,36 +493,41 @@ async fn install() -> Result<()> {
     )
     .await?;
     // Guard against a stale build ever again: the installed binary must report the fetched commit.
-    let out = Command::new("wsconnect")
+    let out = Command::new("workstation-connect")
         .arg("--version")
         .output()
         .await
-        .context("run wsconnect")?;
+        .context("run workstation-connect")?;
     let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !version.contains(&format!("({head})")) {
         bail!(
-            "installed `{version}`, expected commit {head} (PATH has another wsconnect, or stale build: delete {})",
+            "installed `{version}`, expected commit {head} (PATH has another workstation-connect, or stale build: delete {})",
             cache.display()
         );
     }
     println!("installed {version}");
-    let active = Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", "wsconnect"])
-        .status()
-        .await
-        .is_ok_and(|s| s.success());
-    if active {
-        let status = Command::new("systemctl")
-            .args(["--user", "restart", "wsconnect"])
+    // TRANSITIONAL: "wsconnect" = pre-rename unit, in case its migration hasn't happened
+    // (remove with src/bin/wsconnect.rs).
+    for unit in ["workstation-connect", "wsconnect"] {
+        let active = Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", unit])
             .status()
             .await
-            .context("start systemctl")?;
-        if !status.success() {
-            bail!("systemctl --user restart wsconnect: {status}");
+            .is_ok_and(|s| s.success());
+        if active {
+            let status = Command::new("systemctl")
+                .args(["--user", "restart", unit])
+                .status()
+                .await
+                .context("start systemctl")?;
+            if !status.success() {
+                bail!("systemctl --user restart {unit}: {status}");
+            }
+            println!("daemon restarted");
+            break;
         }
-        println!("daemon restarted");
     }
-    println!("wsconnect updated");
+    println!("workstation-connect updated");
     Ok(())
 }
 

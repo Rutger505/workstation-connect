@@ -272,7 +272,7 @@ pub async fn pause_sync(on: bool) -> Result<()> {
     let state = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("wsconnect-paused-providers");
+        .join("workstation-connect-paused-providers");
     let kde = Kde::connect().await?;
     if on {
         let enabled: Vec<String> = kde

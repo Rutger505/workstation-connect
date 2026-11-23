@@ -5,7 +5,7 @@ Phone ↔ laptop link for a Pixel 9 and an Arch/Hyprland laptop.
 - Phone app: [Rutger505/workstation-connect-android](https://github.com/Rutger505/workstation-connect-android),
   a KDE Connect Android fork (GPL) with its own home screen, auto hotspot (Bluetooth RFCOMM server +
   Shizuku tethering) and a trackpad with volume keys as mouse buttons.
-- `laptop/`: `wsconnect`, Rust daemon (NetworkManager watch, Bluetooth trigger) + CLI + waybar module +
+- `laptop/`: `workstation-connect`, Rust daemon (NetworkManager watch, Bluetooth trigger) + CLI + waybar module +
   action menu. Uses headless `kdeconnectd` over D-Bus as the engine for notifications, clipboard,
   files and pairing.
 - `spike/`: phase 0 experiments (tethering via Shizuku, timing script).
@@ -51,10 +51,10 @@ link up while awake, reconnecting when it drops. Several laptops may be connecte
 ```
 sudo pacman -S kdeconnect   # engine; also: scrcpy android-tools zenity (optional actions)
 systemctl --user start app-org.kde.kdeconnect.daemon@autostart.service   # not a bare kdeconnectd, see trackpad
-cargo install --git https://github.com/Rutger505/workstation-connect wsconnect
+cargo install --git https://github.com/Rutger505/workstation-connect workstation-connect
 mkdir -p ~/.config/workstation-connect ~/.config/systemd/user
 cp laptop/dist/config.example.toml ~/.config/workstation-connect/config.toml   # edit
-cp laptop/dist/wsconnect.service ~/.config/systemd/user/
+cp laptop/dist/workstation-connect.service ~/.config/systemd/user/
 
 # pair the phone once via normal Bluetooth (desktop Bluetooth menu, or phone: Settings → Connected
 # devices → Pair new device; bluetoothctl pair <phone MAC> works too). No BlueZ config changes needed.
@@ -78,18 +78,18 @@ echo '{"remote": ["org.kde.kdeconnect.daemon"]}' > ~/.config/xdg-desktop-portal-
 printf '[D-BUS Service]\nName=org.kde.kdeconnect\nExec=/usr/bin/kdeconnectd\nSystemdService=app-org.kde.kdeconnect.daemon@autostart.service\n' \
   > ~/.local/share/dbus-1/services/org.kde.kdeconnect.service
 
-wsconnect setup   # once, after pairing in the app: laptop notifications → phone, Bluetooth link, share_dir
-systemctl --user enable --now wsconnect
-journalctl --user -fu wsconnect
+workstation-connect setup   # once, after pairing in the app: laptop notifications → phone, Bluetooth link, share_dir
+systemctl --user enable --now workstation-connect
+journalctl --user -fu workstation-connect
 ```
 
 **Waybar**
 ```jsonc
 "custom/phone": {
-  "exec": "wsconnect waybar",
+  "exec": "workstation-connect waybar",
   "return-type": "json",
-  "on-click": "wsconnect toggle",
-  "on-click-right": "wsconnect menu"
+  "on-click": "workstation-connect toggle",
+  "on-click-right": "workstation-connect menu"
 }
 ```
 Phone battery/signal come from the Bluetooth link when in reach, else from KDE Connect.
@@ -98,13 +98,13 @@ Outdated install (GitHub main has newer `laptop/` commits): daemon checks every 
 network reconnect, via `git ls-remote` (no API quota); the GitHub compare API only for a main sha it
 hasn't seen yet (60 requests/h per IP). Text gets `󰚰`, tooltip shows `installed → latest`, class
 becomes `["<class>", "outdated"]`.
-- `auto_update = true` (default): installs at once, no click: `wsconnect update` in the transient
-  user unit `wsconnect-update` (`systemd-run --user`, outside the daemon's cgroup, since the update
+- `auto_update = true` (default): installs at once, no click: `workstation-connect update` in the transient
+  user unit `workstation-connect-update` (`systemd-run --user`, outside the daemon's cgroup, since the update
   restarts the daemon). Class adds `updating` meanwhile. Failed (daemon still alive afterwards):
   class adds `update-failed`, that commit is retried after 30 min (a newer commit at once; state in
-  `~/.local/state/wsconnect/update.failed`), menu gets **Update wsconnect**. Log:
-  `journalctl --user -u wsconnect-update`.
-- `auto_update = false`: only the marker; menu gets **Update wsconnect**.
+  `~/.local/state/workstation-connect/update.failed`), menu gets **Update workstation-connect**. Log:
+  `journalctl --user -u workstation-connect-update`.
+- `auto_update = false`: only the marker; menu gets **Update workstation-connect**.
 Phone not paired over classic Bluetooth (or bond lost): text gets `󰀦`, class `not-paired`; pair it
 in the Bluetooth menu. Phone paged fine but its RFCOMM service didn't answer 3 tries in a row (app
 not running / no Bluetooth permission): `󰀦`, class `service-missing`.
@@ -115,14 +115,14 @@ first state frame. Idle link: ping every 60 s (15 s to answer); after resume a p
 answer, else reconnect (every 1 s for 20 s, then 2/5/10/30/60 s backoff).
 
 **Log upload** (private S3 bucket `wsconnect-logs` on `https://cdn.rutgerpronk.com`, SeaweedFS,
-path-style, SigV4, region us-east-1): `wsconnect logs-key <access> <secret>` writes the write-only
+path-style, SigV4, region us-east-1): `workstation-connect logs-key <access> <secret>` writes the write-only
 key to `~/.config/workstation-connect/logs.env` (mode 600, never in the repo; lines
 `WSCONNECT_LOGS_ACCESS_KEY=…`, `WSCONNECT_LOGS_SECRET_KEY=…`), used from the next upload on, no
 restart. No file: upload off (one info line).
 - Object: `laptop/<hostname>/<YYYY-MM-DD>/<HHMMSS>-<reason>.log` (UTC), text/plain. Header (host,
-  version, kernel, reason, time), then the user journal of `wsconnect`, `wsconnect-update` and
+  version, kernel, reason, time), then the user journal of `workstation-connect`, `workstation-connect-update` and
   `app-org.kde.kdeconnect.daemon@*` since the last successful upload (cursor in
-  `~/.local/state/wsconnect/upload.cursor`; first time: last hour), plus best effort the system
+  `~/.local/state/workstation-connect/upload.cursor`; first time: last hour), plus best effort the system
   journal of `bluetooth.service` and Bluetooth kernel lines (needs journal read access). Newest
   ~1 MB.
 - Reasons: `start` (daemon start, so also after an update), `link-ok` / `link-fail` (phone link
@@ -133,7 +133,7 @@ restart. No file: upload off (one info line).
 - The daemon logs KDE Connect changes (reachable, link types, loaded plugins, D-Bus errors) and its
   own KDE Connect actions, so input/notification/clipboard problems show up there too.
 
-**Selftest**: `wsconnect selftest [--no-hotspot] [--no-send]` prints PASS/FAIL/SKIP per step with
+**Selftest**: `workstation-connect selftest [--no-hotspot] [--no-send]` prints PASS/FAIL/SKIP per step with
 timings (exit code 1 on any FAIL):
 - a. versions (CLI, daemon, phone app protocol), daemon reachable, up to date, config,
   `hotspot_connection` in NetworkManager, `logs.env`.
@@ -150,21 +150,29 @@ timings (exit code 1 on any FAIL):
   `someclaw-thread send new -` (dev-env); prints the thread URL. Fails: says so, report stays in
   the bucket.
 
-Daemon socket `$XDG_RUNTIME_DIR/wsconnect.sock`, one request line, one JSON answer line:
+Daemon socket `$XDG_RUNTIME_DIR/workstation-connect.sock`, one request line, one JSON answer line:
 `status | pause | resume | toggle`, `watch` (status line on every change), or JSON
 `{"cmd": "selftest_link"}`, `{"cmd": "selftest_hotspot"}` (→ `{"steps": [{name, res, ms, detail}]}`),
 `{"cmd": "upload", "reason": "<reason>", "report": "…"}` (→ `{"key": …}`, null when upload off);
 errors `{"error": "…"}`. Status has `version` (the running daemon's).
 
-CLI: `wsconnect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update | logs-key | selftest`.
+CLI: `workstation-connect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update | logs-key | selftest`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
 - `menu`: walker/fuzzel/wofi/rofi (dmenu mode), first found; override with `menu = [...]` in config.
 - `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,
   else finds the phone via mDNS (same network). First time: `adb pair <ip:port> <code>`.
 - `browse`: mounts the phone over sftp (kdeconnectd) and opens it with xdg-open.
-- `update`: clones/fetches main into `~/.cache/wsconnect/src`, `cargo install --path … --force --locked --target-dir ~/.cache/wsconnect/target` (kept build cache: only changed crates recompile), checks the installed `--version` matches the fetched commit, then restarts the daemon if active. One at a time (lock `~/.cache/wsconnect/update.lock`). Menu runs it
+- `update`: clones/fetches main into `~/.cache/workstation-connect/src`, `cargo install --path … --force --locked --target-dir ~/.cache/workstation-connect/target` (kept build cache: only changed crates recompile), checks the installed `--version` matches the fetched commit, then restarts the daemon if active. One at a time (lock `~/.cache/workstation-connect/update.lock`). Menu runs it
   via `xdg-terminal-exec`, else `$TERMINAL -e`. `--version` shows the build commit (`unknown`
   without git: no update check).
+- Rename `wsconnect` → `workstation-connect` (TRANSITIONAL): the package also installs a `wsconnect`
+  shim (`laptop/src/bin/wsconnect.rs`) that execs `workstation-connect`, so old updaters and
+  `wsconnect.service` still work. At daemon start `laptop/src/migrate.rs` moves
+  `~/.local/state/wsconnect`, drops `~/.cache/wsconnect`, installs + enables
+  `workstation-connect.service`, removes `wsconnect.service` (handing over when running in it),
+  switches the omarchy bar entry `rutger.wsconnect` → `rutger.workstation-connect` and then deletes
+  the shim. Remove shim, migration and the old unit names once the laptop runs
+  `workstation-connect.service`.
 
 ## Build
 

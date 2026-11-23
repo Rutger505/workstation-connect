@@ -13,7 +13,7 @@ use tokio::sync::watch;
 pub async fn request(cmd: &str) -> Result<String> {
     let mut s = UnixStream::connect(socket_path())
         .await
-        .context("daemon not running (systemctl --user status wsconnect)")?;
+        .context("daemon not running (systemctl --user status workstation-connect)")?;
     s.write_all(format!("{cmd}\n").as_bytes()).await?;
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).await?;
@@ -176,7 +176,7 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
                 .unwrap_or_default()
                 .trim_matches('"')
         )),
-        None => tip.push("wsconnect daemon not running (auto hotspot off)".into()),
+        None => tip.push("workstation-connect daemon not running (auto hotspot off)".into()),
     }
     if daemon.is_some() {
         tip.push(if bt {
@@ -224,16 +224,16 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if let Some((installed, latest, state)) = &update {
         tip.push(match state.as_str() {
             "updating" => format!(
-                "wsconnect updating: {installed} → {latest} (journalctl --user -u {})",
+                "workstation-connect updating: {installed} → {latest} (journalctl --user -u {})",
                 crate::update::UNIT
             ),
             "failed" => format!(
-                "wsconnect update {installed} → {latest} failed, auto retry within {} min \
-                 (journalctl --user -u {}; menu: Update wsconnect)",
+                "workstation-connect update {installed} → {latest} failed, auto retry within {} min \
+                 (journalctl --user -u {}; menu: Update workstation-connect)",
                 crate::update::FAILED_BACKOFF.as_secs() / 60,
                 crate::update::UNIT
             ),
-            _ => format!("wsconnect update: {installed} → {latest} (wsconnect update)"),
+            _ => format!("workstation-connect update: {installed} → {latest} (workstation-connect update)"),
         });
     }
     tip.push("click: pause/resume everything · right-click: menu".into());
@@ -291,12 +291,9 @@ mod tests {
         let w = format_waybar(Some(&v), &kde_phone(true));
         assert_eq!(w["text"], "󰄜 55% ▄ 󰚰");
         assert_eq!(w["class"], json!(["idle", "outdated"]));
-        assert!(
-            w["tooltip"]
-                .as_str()
-                .unwrap()
-                .contains("wsconnect update: abc1234 → def5678 (wsconnect update)")
-        );
+        assert!(w["tooltip"].as_str().unwrap().contains(
+            "workstation-connect update: abc1234 → def5678 (workstation-connect update)"
+        ));
         v["update"]["state"] = json!("updating");
         let w = format_waybar(Some(&v), &kde_phone(true));
         assert_eq!(w["text"], "󰄜 55% ▄ 󰚰");
@@ -305,7 +302,7 @@ mod tests {
             w["tooltip"]
                 .as_str()
                 .unwrap()
-                .contains("wsconnect updating: abc1234 → def5678")
+                .contains("workstation-connect updating: abc1234 → def5678")
         );
         v["update"]["state"] = json!("failed");
         let w = format_waybar(Some(&v), &kde_phone(true));
