@@ -326,6 +326,9 @@ fn info_line(installed: &str, view: &MenuStatus) -> String {
     };
     line.push_str(" · ");
     line.push_str(&state);
+    if status.is_some_and(|v| v["kde_health"]["state"] == "hung") {
+        line.push_str(" · kdeconnectd hung, restarting");
+    }
     line
 }
 
@@ -520,6 +523,9 @@ mod tests {
             info_line("unknown", &unknown),
             "󰋼  workstation-connect unknown · update check off (build commit unknown)"
         );
+        let hung = MenuStatus::Checked(json!({"version": "v12", "update": null,
+            "update_check": ok, "kde_health": {"state": "hung"}}));
+        assert!(info(&hung).ends_with("· up to date · kdeconnectd hung, restarting"));
         let old_daemon =
             MenuStatus::Checked(json!({"version": "v11", "update": null, "update_check": ok}));
         assert!(info(&old_daemon).contains("v12 (running daemon: v11) · up to date"));

@@ -4,11 +4,31 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use std::time::Duration;
 use tracing::{debug, info, trace};
 use zbus::{Connection, Proxy};
 
 const DEST: &str = "org.kde.kdeconnect";
 const ROOT: &str = "/modules/kdeconnect";
+/// Every kdeconnectd call (zbus never times out by itself; kdeconnectd can hang for days with its
+/// name still on the bus). Generous: `mountAndWait` waits for the phone.
+const CALL: Duration = Duration::from_secs(30);
+/// Health probe: a healthy kdeconnectd answers `selfId` in milliseconds.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The user unit kdeconnectd must run in (xdg autostart + D-Bus activation override, README).
+pub const UNIT: &str = "app-org.kde.kdeconnect.daemon@autostart.service";
+/// systemctl calls (restart of a hung kdeconnectd: SIGTERM ends it, its main thread isn't needed).
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// kdeconnectd's state as seen by a probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    Ok,
+    /// Name not on the session bus: not started yet; D-Bus activation starts it on first use.
+    NotRunning,
+    /// On the bus but no answer within [`PROBE_TIMEOUT`].
+    Hung,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Phone {
@@ -59,9 +79,51 @@ pub struct Kde {
 
 impl Kde {
     pub async fn connect() -> Result<Self> {
-        Ok(Self {
-            conn: Connection::session().await.context("session bus")?,
-        })
+        let conn = zbus::connection::Builder::session()
+            .context("session bus")?
+            .method_timeout(CALL)
+            .build()
+            .await
+            .context("session bus")?;
+        Ok(Self { conn })
+    }
+
+    /// Cheap liveness check: is the name owned, and does kdeconnectd's main loop answer
+    /// (`selfId`, dispatched on its main thread like every real call)? Err: the probe itself
+    /// failed (bus trouble, error reply), not a verdict on kdeconnectd.
+    pub async fn health(&self) -> Result<Health> {
+        let t = std::time::Instant::now();
+        let bus = zbus::fdo::DBusProxy::new(&self.conn)
+            .await
+            .context("dbus proxy")?;
+        let name = zbus::names::BusName::try_from(DEST).expect("valid bus name");
+        let owned = tokio::time::timeout(PROBE_TIMEOUT, bus.name_has_owner(name))
+            .await
+            .context("dbus NameHasOwner: no answer from the bus")?
+            .context("dbus NameHasOwner")?;
+        if !owned {
+            debug!("kde connect: health: kdeconnectd not on the bus");
+            return Ok(Health::NotRunning);
+        }
+        let daemon = self.proxy(ROOT.into(), "org.kde.kdeconnect.daemon").await?;
+        match tokio::time::timeout(PROBE_TIMEOUT, daemon.call::<_, _, String>("selfId", &())).await
+        {
+            Ok(Ok(_)) => {
+                trace!(
+                    elapsed_ms = t.elapsed().as_millis() as u64,
+                    "kde connect: health ok"
+                );
+                Ok(Health::Ok)
+            }
+            Ok(Err(e)) => Err(e).context("kdeconnectd selfId"),
+            Err(_) => {
+                debug!(
+                    timeout_s = PROBE_TIMEOUT.as_secs(),
+                    "kde connect: health: kdeconnectd on the bus but selfId unanswered"
+                );
+                Ok(Health::Hung)
+            }
+        }
     }
 
     async fn proxy(&self, path: String, iface: &'static str) -> Result<Proxy<'static>> {
@@ -82,13 +144,63 @@ impl Kde {
         self.proxy(path, iface).await
     }
 
+    /// What the kdeconnectd process is stuck on, for the log before a restart: pid and per
+    /// thread name, state and kernel wait channel (e.g. `kdeconnectd S futex_wait_queue`).
+    pub async fn hung_details(&self) -> String {
+        let pid = async {
+            let bus = zbus::fdo::DBusProxy::new(&self.conn).await?;
+            let name = zbus::names::BusName::try_from(DEST).expect("valid bus name");
+            Ok::<u32, zbus::Error>(bus.get_connection_unix_process_id(name).await?)
+        };
+        let pid = match tokio::time::timeout(PROBE_TIMEOUT, pid).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return format!("pid unknown: {e}"),
+            Err(_) => return "pid unknown: no answer from the bus".into(),
+        };
+        let read = |p: std::path::PathBuf| {
+            std::fs::read_to_string(p)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "?".into())
+        };
+        let mut threads = Vec::new();
+        match std::fs::read_dir(format!("/proc/{pid}/task")) {
+            Ok(dir) => {
+                for t in dir.flatten() {
+                    let state = read(t.path().join("stat"));
+                    // stat: "tid (comm) S ...": state is the field after the closing paren.
+                    let state = state
+                        .rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                        .unwrap_or("?")
+                        .to_string();
+                    threads.push(format!(
+                        "{} {state} {}",
+                        read(t.path().join("comm")),
+                        read(t.path().join("wchan"))
+                    ));
+                }
+            }
+            Err(e) => return format!("pid {pid}: threads unreadable: {e}"),
+        }
+        threads.sort();
+        format!("pid {pid}, threads: {}", threads.join(", "))
+    }
+
     /// Paired device ids.
     pub async fn paired(&self) -> Result<Vec<String>> {
         let daemon = self.proxy(ROOT.into(), "org.kde.kdeconnect.daemon").await?;
-        daemon
+        let r: Result<Vec<String>> = daemon
             .call("devices", &(false, true))
             .await
-            .context("kdeconnectd not running? (kdeconnectd / kdeconnect-indicator)")
+            .map_err(Into::into);
+        r.map_err(|e| {
+            let hint = if timed_out(&e) {
+                "kdeconnectd not answering (hung? the daemon restarts it)"
+            } else {
+                "kdeconnectd not running? (kdeconnectd / kdeconnect-indicator)"
+            };
+            e.context(hint)
+        })
     }
 
     /// Reachable but unpaired devices as "name (id)": tells "phone not visible" apart from
@@ -139,7 +251,8 @@ impl Kde {
             None => {
                 let seen = match self.unpaired_reachable().await {
                     Ok(v) if v.is_empty() => {
-                        "phone not visible to KDE Connect either (same network? app running?)".into()
+                        "phone not visible to KDE Connect either (same network? app running?)"
+                            .into()
                     }
                     Ok(v) => format!("visible but unpaired: {}", v.join(", ")),
                     Err(e) => {
@@ -343,6 +456,61 @@ impl Kde {
         debug!(provider, on, "kde connect: link provider set");
         Ok(())
     }
+}
+
+/// A kdeconnectd call ran into the [`CALL`] timeout (kdeconnectd possibly hung).
+pub fn timed_out(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| match c.downcast_ref::<zbus::Error>() {
+        Some(zbus::Error::InputOutput(io)) => io.kind() == std::io::ErrorKind::TimedOut,
+        _ => false,
+    })
+}
+
+async fn systemctl(args: &[&str]) -> Result<(bool, String)> {
+    let out = tokio::time::timeout(
+        SYSTEMCTL_TIMEOUT,
+        tokio::process::Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "systemctl --user {}: no result in {} s",
+            args.join(" "),
+            SYSTEMCTL_TIMEOUT.as_secs()
+        )
+    })?
+    .with_context(|| format!("systemctl --user {}", args.join(" ")))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok((out.status.success(), text.trim().to_string()))
+}
+
+/// Is kdeconnectd's unit active? Hung kdeconnectd outside it (bare `kdeconnectd`) can't be
+/// restarted through it: starting the unit would only add a second instance.
+pub async fn unit_active() -> Result<bool> {
+    Ok(systemctl(&["is-active", "--quiet", UNIT]).await?.0)
+}
+
+/// Restarts kdeconnectd's unit (it then reconnects to the phone by itself).
+pub async fn restart() -> Result<()> {
+    let t = std::time::Instant::now();
+    let (ok, out) = systemctl(&["restart", UNIT]).await?;
+    if !ok {
+        bail!("systemctl --user restart {UNIT}: {out}");
+    }
+    info!(
+        unit = UNIT,
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "kde connect: kdeconnectd restarted"
+    );
+    Ok(())
 }
 
 /// Pause = KDE Connect fully off too: disables every enabled link provider and remembers which

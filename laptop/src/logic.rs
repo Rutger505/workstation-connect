@@ -71,9 +71,156 @@ pub fn wifi_left(prev: &str, new: &str) -> bool {
     prev != "/" && prev != new
 }
 
+/// kdeconnectd watchdog: probe interval, and the earliest re-probe when a KDE Connect call timed out.
+pub const KDE_PROBE_EVERY: Duration = Duration::from_secs(120);
+pub const KDE_PROBE_MIN_GAP: Duration = Duration::from_secs(30);
+/// Consecutive hung probes before a restart.
+pub const KDE_HUNG_LIMIT: u32 = 2;
+/// At most one restart per this window: no restart loop when a restart doesn't help.
+pub const KDE_RESTART_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
+/// One kdeconnectd health probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KdeProbe {
+    Ok,
+    /// Not on the bus: D-Bus activation starts it when needed, nothing to fix.
+    NotRunning,
+    /// On the bus, but no answer in time.
+    Hung,
+    /// Probe itself failed (bus trouble, error reply): says nothing about a hang.
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KdeVerdict {
+    Fine,
+    /// No new information (probe error): counter kept.
+    Unchanged,
+    /// Hung, `n` in a row, below the limit.
+    Hung(u32),
+    /// Restart now (recorded as done: a failed restart also counts for the backoff).
+    Restart,
+    /// Hung past the limit, but restarted less than the backoff ago. `first`: first skip of
+    /// this hang (log it once).
+    Backoff {
+        left: Duration,
+        first: bool,
+    },
+}
+
+#[derive(Debug, Default)]
+pub struct KdeWatchdog {
+    hung: u32,
+    last_restart: Option<Instant>,
+    backoff_noted: bool,
+}
+
+impl KdeWatchdog {
+    pub fn observe(&mut self, probe: KdeProbe, now: Instant) -> KdeVerdict {
+        match probe {
+            KdeProbe::Ok | KdeProbe::NotRunning => {
+                self.hung = 0;
+                self.backoff_noted = false;
+                KdeVerdict::Fine
+            }
+            KdeProbe::Error => KdeVerdict::Unchanged,
+            KdeProbe::Hung => {
+                self.hung += 1;
+                if self.hung < KDE_HUNG_LIMIT {
+                    return KdeVerdict::Hung(self.hung);
+                }
+                if let Some(t) = self.last_restart
+                    && now - t < KDE_RESTART_BACKOFF
+                {
+                    let first = !self.backoff_noted;
+                    self.backoff_noted = true;
+                    return KdeVerdict::Backoff {
+                        left: KDE_RESTART_BACKOFF - (now - t),
+                        first,
+                    };
+                }
+                self.hung = 0;
+                self.backoff_noted = false;
+                self.last_restart = Some(now);
+                KdeVerdict::Restart
+            }
+        }
+    }
+
+    /// Probe now (a KDE Connect call timed out) instead of waiting for the interval?
+    pub fn early_probe_ok(last_probe: Instant, now: Instant) -> bool {
+        now - last_probe >= KDE_PROBE_MIN_GAP
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kde_watchdog_restarts_after_two_hangs() {
+        let t0 = Instant::now();
+        let mut w = KdeWatchdog::default();
+        assert_eq!(w.observe(KdeProbe::Hung, t0), KdeVerdict::Hung(1));
+        // Any answer in between resets the count.
+        assert_eq!(w.observe(KdeProbe::Ok, t0), KdeVerdict::Fine);
+        assert_eq!(w.observe(KdeProbe::Hung, t0), KdeVerdict::Hung(1));
+        assert_eq!(w.observe(KdeProbe::NotRunning, t0), KdeVerdict::Fine);
+        assert_eq!(w.observe(KdeProbe::Hung, t0), KdeVerdict::Hung(1));
+        // Probe errors neither count nor reset.
+        assert_eq!(w.observe(KdeProbe::Error, t0), KdeVerdict::Unchanged);
+        assert_eq!(w.observe(KdeProbe::Hung, t0), KdeVerdict::Restart);
+        // Counting starts over after a restart.
+        assert_eq!(w.observe(KdeProbe::Hung, t0), KdeVerdict::Hung(1));
+    }
+
+    #[test]
+    fn kde_watchdog_backs_off_between_restarts() {
+        let t0 = Instant::now();
+        let min = |m: u64| t0 + Duration::from_secs(m * 60);
+        let mut w = KdeWatchdog::default();
+        w.observe(KdeProbe::Hung, t0);
+        assert_eq!(w.observe(KdeProbe::Hung, min(2)), KdeVerdict::Restart);
+        // Still hung after the restart: skipped until 10 min after it, logged once.
+        assert_eq!(w.observe(KdeProbe::Hung, min(4)), KdeVerdict::Hung(1));
+        assert_eq!(
+            w.observe(KdeProbe::Hung, min(6)),
+            KdeVerdict::Backoff {
+                left: Duration::from_secs(6 * 60),
+                first: true
+            }
+        );
+        assert_eq!(
+            w.observe(KdeProbe::Hung, min(8)),
+            KdeVerdict::Backoff {
+                left: Duration::from_secs(4 * 60),
+                first: false
+            }
+        );
+        assert_eq!(w.observe(KdeProbe::Hung, min(12)), KdeVerdict::Restart);
+        // A recovery in between makes the next backoff skip log again.
+        w.observe(KdeProbe::Hung, min(13));
+        assert!(matches!(
+            w.observe(KdeProbe::Hung, min(14)),
+            KdeVerdict::Backoff { first: true, .. }
+        ));
+        w.observe(KdeProbe::Ok, min(15));
+        w.observe(KdeProbe::Hung, min(16));
+        assert!(matches!(
+            w.observe(KdeProbe::Hung, min(17)),
+            KdeVerdict::Backoff { first: true, .. }
+        ));
+    }
+
+    #[test]
+    fn kde_early_probe_gap() {
+        let t0 = Instant::now();
+        assert!(!KdeWatchdog::early_probe_ok(
+            t0,
+            t0 + Duration::from_secs(29)
+        ));
+        assert!(KdeWatchdog::early_probe_ok(t0, t0 + KDE_PROBE_MIN_GAP));
+    }
 
     #[test]
     fn wifi_left_only_when_leaving_a_connection() {

@@ -55,6 +55,29 @@ pub struct Status {
     pub update: Option<crate::update::Update>,
     /// Last finished update check (None: none yet, or the build commit is unknown).
     pub update_check: Option<crate::update::Check>,
+    /// kdeconnectd watchdog.
+    pub kde_health: KdeHealth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KdeState {
+    /// No probe yet.
+    Unknown,
+    Ok,
+    /// Not on the bus (D-Bus activation starts it on first use).
+    NotRunning,
+    /// On the bus but not answering; restarted after 2 probes in a row.
+    Hung,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct KdeHealth {
+    pub state: KdeState,
+    /// Last restart by the watchdog, unix seconds.
+    pub last_restart: Option<u64>,
+    /// Why the last restart failed (cleared by the next successful one).
+    pub restart_error: Option<String>,
 }
 
 struct Ctx {
@@ -72,6 +95,8 @@ struct Ctx {
     uploader: Uploader,
     /// To the update watch loop: check now (ctl `check`).
     check_now: tokio::sync::mpsc::Sender<crate::update::CheckRequest>,
+    /// A KDE Connect call timed out: kdeconnectd watchdog probes early.
+    kde_poke: tokio::sync::Notify,
 }
 
 impl Ctx {
@@ -182,6 +207,11 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
         error: None,
         update: None,
         update_check: None,
+        kde_health: KdeHealth {
+            state: KdeState::Unknown,
+            last_restart: None,
+            restart_error: None,
+        },
     });
     let (check_now, check_requests) = tokio::sync::mpsc::channel(16);
     let ctx = Arc::new(Ctx {
@@ -195,6 +225,7 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
         resumes: watch::channel(0).0,
         uploader: Uploader::spawn(),
         check_now,
+        kde_poke: tokio::sync::Notify::new(),
     });
     info!(
         "workstation-connect {} started",
@@ -238,6 +269,7 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
     tokio::spawn(link_events(ctx.clone()));
     tokio::spawn(periodic_upload(ctx.clone()));
     tokio::spawn(kde_watch(ctx.clone()));
+    tokio::spawn(kde_watchdog(ctx.clone()).instrument(info_span!("kde_watchdog")));
     tokio::spawn(reconnect_watch(ctx.clone(), reconnected));
     tokio::spawn(sleep_guard(ctx.clone()));
     tokio::spawn(wifi_guard(ctx.clone()));
@@ -628,6 +660,9 @@ async fn kde_watch(ctx: Arc<Ctx>) {
             }
             Err(e) => {
                 kde = None; // reconnect: bus or kdeconnectd restarted
+                if crate::kde::timed_out(&e) {
+                    ctx.kde_poke.notify_one();
+                }
                 let e = format!("{e:#}");
                 if last_err.as_ref() != Some(&e) {
                     warn!("kde connect: {e}");
@@ -638,6 +673,135 @@ async fn kde_watch(ctx: Arc<Ctx>) {
         }
         sleep(Duration::from_secs(15)).await;
     }
+}
+
+/// kdeconnectd watchdog: probes every 2 min (earlier when a KDE Connect call timed out, at
+/// most every 30 s); 2 hung probes in a row → restart its unit, at most once per 10 min. Runs
+/// during pause too: pause only disables link providers, kdeconnectd keeps running.
+async fn kde_watchdog(ctx: Arc<Ctx>) {
+    use crate::kde::{Health, Kde};
+    use logic::{KdeProbe, KdeVerdict, KdeWatchdog};
+    let mut wd = KdeWatchdog::default();
+    let mut kde: Option<Kde> = None;
+    let mut last_err: Option<String> = None;
+    loop {
+        let probed_at = Instant::now();
+        if kde.is_none() {
+            match Kde::connect().await {
+                Ok(k) => kde = Some(k),
+                Err(e) => warn!("kde watchdog: {e:#}"),
+            }
+        }
+        let probe = match &kde {
+            None => KdeProbe::Error,
+            Some(k) => match k.health().await {
+                Ok(Health::Ok) => KdeProbe::Ok,
+                Ok(Health::NotRunning) => KdeProbe::NotRunning,
+                Ok(Health::Hung) => KdeProbe::Hung,
+                Err(e) => {
+                    let e = format!("{e:#}");
+                    if last_err.as_ref() != Some(&e) {
+                        debug!("kde watchdog: probe failed: {e}");
+                        last_err = Some(e);
+                    }
+                    kde = None; // fresh connection next time
+                    KdeProbe::Error
+                }
+            },
+        };
+        if probe != KdeProbe::Error {
+            last_err = None;
+        }
+        let state = match probe {
+            KdeProbe::Ok => Some(KdeState::Ok),
+            KdeProbe::NotRunning => Some(KdeState::NotRunning),
+            KdeProbe::Hung => Some(KdeState::Hung),
+            KdeProbe::Error => None,
+        };
+        let before = ctx.status.borrow().kde_health.state;
+        if let Some(state) = state {
+            if state != before {
+                match state {
+                    KdeState::Hung => warn!(
+                        timeout_s = crate::kde::PROBE_TIMEOUT.as_secs(),
+                        "kdeconnectd hung: on the bus but not answering"
+                    ),
+                    _ if before == KdeState::Hung => info!(?state, "kdeconnectd answers again"),
+                    _ => debug!(?state, "kdeconnectd state"),
+                }
+            }
+            ctx.set(|s| s.kde_health.state = state);
+        }
+        match wd.observe(probe, probed_at) {
+            KdeVerdict::Fine | KdeVerdict::Unchanged => {}
+            KdeVerdict::Hung(n) => debug!(
+                n,
+                limit = logic::KDE_HUNG_LIMIT,
+                "kde watchdog: hung probe, not restarting yet"
+            ),
+            KdeVerdict::Backoff { left, first } => {
+                if first {
+                    warn!(
+                        left_s = left.as_secs(),
+                        "kdeconnectd still hung after a restart: next restart allowed in {} s",
+                        left.as_secs()
+                    );
+                } else {
+                    debug!(left_s = left.as_secs(), "kde watchdog: restart backoff");
+                }
+            }
+            KdeVerdict::Restart => restart_kdeconnectd(&ctx, kde.as_ref()).await,
+        }
+        tokio::select! {
+            _ = sleep(logic::KDE_PROBE_EVERY) => {}
+            _ = async {
+                ctx.kde_poke.notified().await;
+                let now = Instant::now();
+                if !KdeWatchdog::early_probe_ok(probed_at, now) {
+                    sleep(logic::KDE_PROBE_MIN_GAP - (now - probed_at)).await;
+                }
+            } => debug!("kde watchdog: early probe (a KDE Connect call timed out)"),
+        }
+    }
+}
+
+async fn restart_kdeconnectd(ctx: &Ctx, kde: Option<&crate::kde::Kde>) {
+    let unit = crate::kde::UNIT;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let result = match crate::kde::unit_active().await {
+        Ok(true) => {
+            let details = match kde {
+                Some(k) => k.hung_details().await,
+                None => "no bus connection".into(),
+            };
+            warn!(
+                unit,
+                hung_probes = logic::KDE_HUNG_LIMIT,
+                "kdeconnectd hung: restarting its unit; was: {details}"
+            );
+            crate::kde::restart().await
+        }
+        Ok(false) => Err(anyhow::anyhow!(
+            "kdeconnectd runs outside {unit} (bare kdeconnectd?): not restarting it, \
+             kill it by hand and start the unit (README setup)"
+        )),
+        Err(e) => Err(e.context("is kdeconnectd's unit active")),
+    };
+    let restart_error = match result {
+        Ok(()) => None,
+        Err(e) => {
+            error!("kdeconnectd restart failed: {e:#}");
+            Some(format!("{e:#}"))
+        }
+    };
+    ctx.set(|s| {
+        s.kde_health.last_restart = Some(now);
+        s.kde_health.restart_error = restart_error;
+    });
+    ctx.uploader.trigger(Reason::KdeRestart);
 }
 
 /// Pokes the update check on every network (re)connect.
@@ -890,9 +1054,13 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
                 });
             }
         }
+        let c = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::kde::pause_sync(on).await {
                 warn!("kde connect pause={on}: {e:#}");
+                if crate::kde::timed_out(&e) {
+                    c.kde_poke.notify_one();
+                }
             }
         });
         info!("paused: {on}");

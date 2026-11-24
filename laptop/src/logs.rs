@@ -37,10 +37,12 @@ pub enum Reason {
     Update,
     Start,
     Selftest,
+    /// kdeconnectd watchdog restarted (or tried to restart) a hung kdeconnectd.
+    KdeRestart,
 }
 
 impl Reason {
-    pub const ALL: [Reason; 8] = [
+    pub const ALL: [Reason; 9] = [
         Reason::Periodic,
         Reason::LinkOk,
         Reason::LinkFail,
@@ -49,6 +51,7 @@ impl Reason {
         Reason::Update,
         Reason::Start,
         Reason::Selftest,
+        Reason::KdeRestart,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -61,6 +64,7 @@ impl Reason {
             Reason::Update => "update",
             Reason::Start => "start",
             Reason::Selftest => "selftest",
+            Reason::KdeRestart => "kde-restart",
         }
     }
 

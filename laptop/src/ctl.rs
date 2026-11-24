@@ -207,6 +207,10 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
     if problem.is_some() {
         text.push_str(" 󰀦");
     }
+    let kde_hung = daemon.is_some_and(|v| v["kde_health"]["state"] == "hung");
+    if kde_hung {
+        text.push_str(" 󰄢");
+    }
 
     let mut tip = Vec::new();
     match mode {
@@ -255,6 +259,16 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
         KdeView::Error(e) => tip.push(format!("KDE Connect: {e}")),
         KdeView::Unknown => {}
     }
+    if kde_hung {
+        tip.push(format!(
+            "kdeconnectd hung (not answering D-Bus): the daemon restarts it, \
+             at most once per 10 min (systemctl --user restart {})",
+            crate::kde::UNIT
+        ));
+    }
+    if let Some(e) = daemon.and_then(|v| v["kde_health"]["restart_error"].as_str()) {
+        tip.push(format!("kdeconnectd restart failed: {e}"));
+    }
     if let Some(s) = daemon.and_then(|v| v["offline_secs"].as_u64()) {
         tip.push(format!("offline for {s}s"));
     }
@@ -302,6 +316,9 @@ pub fn format_waybar(daemon: Option<&Value>, kde: &KdeView) -> Value {
             "not_paired" => "not-paired",
             _ => "service-missing",
         });
+    }
+    if kde_hung {
+        classes.push("kde-hung");
     }
     let class = match classes[..] {
         [c] => json!(c),
@@ -353,6 +370,31 @@ mod tests {
         assert_eq!(w["text"], "󰄜 55% ▄");
         assert_eq!(w["class"], "idle");
         assert!(!w["tooltip"].as_str().unwrap().contains("update"));
+    }
+
+    #[test]
+    fn flags_kde_hung() {
+        let mut v = json!({"mode": "idle", "paused": false,
+            "phone": {"connected": false, "state": null},
+            "kde_health": {"state": "hung", "last_restart": null, "restart_error": null}});
+        let w = format_waybar(Some(&v), &KdeView::Error("timed out".into()));
+        assert_eq!(w["text"], "󰥐 󰄢");
+        assert_eq!(w["class"], json!(["nophone", "kde-hung"]));
+        assert!(w["tooltip"].as_str().unwrap().contains("kdeconnectd hung"));
+        v["kde_health"]["state"] = json!("ok");
+        v["kde_health"]["restart_error"] = json!("systemctl: boom");
+        let w = format_waybar(Some(&v), &kde_phone(true));
+        assert_eq!(w["class"], "idle");
+        assert_eq!(w["text"], "󰄜 55% ▄");
+        assert!(
+            w["tooltip"]
+                .as_str()
+                .unwrap()
+                .contains("kdeconnectd restart failed: systemctl: boom")
+        );
+        // Daemons before the watchdog have no kde_health.
+        v.as_object_mut().unwrap().remove("kde_health");
+        assert_eq!(format_waybar(Some(&v), &kde_phone(true))["class"], "idle");
     }
 
     fn kde_phone(reachable: bool) -> KdeView {

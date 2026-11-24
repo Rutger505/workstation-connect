@@ -243,6 +243,32 @@ async fn section_kde(want: Option<&str>) -> Vec<Step> {
         Ok(k) => k,
         Err(e) => return vec![Step::fail("session bus", Some(t), format!("{e:#}"))],
     };
+    // Hung kdeconnectd: every following call would only time out.
+    let t = Instant::now();
+    match kde.health().await {
+        Ok(crate::kde::Health::Hung) => {
+            return vec![Step::fail(
+                "kdeconnectd answers",
+                Some(t),
+                format!(
+                    "HUNG: on D-Bus but no answer in {} s. The daemon restarts it after 2 hung \
+                     checks (2 min apart, at most once per 10 min); now: systemctl --user restart {}",
+                    crate::kde::PROBE_TIMEOUT.as_secs(),
+                    crate::kde::UNIT
+                ),
+            )];
+        }
+        Ok(h) => steps.push(Step::pass(
+            "kdeconnectd answers",
+            Some(t),
+            match h {
+                crate::kde::Health::NotRunning => "not running yet: D-Bus activation starts it",
+                _ => "yes",
+            },
+        )),
+        Err(e) => steps.push(Step::fail("kdeconnectd answers", Some(t), format!("{e:#}"))),
+    }
+    let t = Instant::now();
     match kde.paired().await {
         Ok(ids) => steps.push(Step::pass(
             "kdeconnectd on D-Bus",
