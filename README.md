@@ -14,7 +14,7 @@ Phone ↔ laptop link for a Pixel 9 and an Arch/Hyprland laptop.
 
 1. Laptop has no internet (no Wi-Fi, or Wi-Fi with captive portal/no internet). Wi-Fi scan: no saved
    network in range → ask the phone at once; else NetworkManager gets `offline_secs` (15 s).
-2. Daemon sends "on" over Bluetooth; the phone starts its Wi-Fi hotspot. The daemon waits (≤20 s) for the
+2. Daemon sends "on" over Bluetooth; the phone starts its Wi-Fi hotspot. The daemon waits (≤10 s) for the
    phone's hotspot flag and joins `hotspot_connection` (rescans + retries, ~45 s total). No hotspot:
    phone off, 60 s cooldown, try again. Bluetooth tethering is gone (BT PAN on the MT7921 had 2-60 s
    RTT): the hotspot is the only way online, Bluetooth only carries on/off and state.
