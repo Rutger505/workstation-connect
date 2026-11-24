@@ -16,3 +16,6 @@ ignore_ssids = ["WiFi in de trein"]
 # auto_update = true
 # Folder for files/photos shared from the phone (applied by `workstation-connect setup`)
 # share_dir = "~/Pictures/Phone"
+# Daemon log level (restart to apply; RUST_LOG wins): "debug" = workstation-connect only, or EnvFilter
+# directives like "workstation_connect=debug,bluer=info". Default: info
+# log_level = "debug"

@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -112,8 +113,10 @@ async fn daemon(req: Value) -> Result<Value> {
 async fn daemon_steps(req: Value) -> Vec<Step> {
     let t = Instant::now();
     match daemon(req).await {
-        Ok(v) => serde_json::from_value(v["steps"].clone())
-            .unwrap_or_else(|e| vec![Step::fail("daemon answer", Some(t), e.to_string())]),
+        Ok(v) => serde_json::from_value(v["steps"].clone()).unwrap_or_else(|e| {
+            debug!("selftest: unexpected daemon answer: {e}");
+            vec![Step::fail("daemon answer", Some(t), e.to_string())]
+        }),
         Err(e) => vec![Step::fail("daemon request", Some(t), format!("{e:#}"))],
     }
 }
@@ -325,12 +328,16 @@ fn portal_step() -> Step {
     let cfg = crate::config::xdg_config();
     let portals = cfg.join("xdg-desktop-portal/hyprland-portals.conf");
     let whitelist = cfg.join("xdg-desktop-portal-luminous/whitelist.json");
-    let routed = std::fs::read_to_string(&portals).is_ok_and(|t| {
+    let read = |p: &std::path::Path| {
+        std::fs::read_to_string(p)
+            .map_err(|e| debug!("selftest: {}: {e}", p.display()))
+            .ok()
+    };
+    let routed = read(&portals).is_some_and(|t| {
         t.lines()
             .any(|l| l.replace(' ', "") == "org.freedesktop.impl.portal.RemoteDesktop=luminous")
     });
-    let listed =
-        std::fs::read_to_string(&whitelist).is_ok_and(|t| t.contains("org.kde.kdeconnect.daemon"));
+    let listed = read(&whitelist).is_some_and(|t| t.contains("org.kde.kdeconnect.daemon"));
     match (routed, listed) {
         (true, true) => Step::pass(
             "trackpad portal config",
@@ -393,6 +400,7 @@ pub fn find_url(out: &str) -> Option<&str> {
 }
 
 pub async fn run(no_hotspot: bool, no_send: bool) -> Result<()> {
+    info!(no_hotspot, no_send, "selftest starting");
     let host = logs::hostname();
     let (cfg, cfg_err) = match Config::load() {
         Ok(c) => (Some(c), String::new()),
@@ -447,6 +455,11 @@ pub async fn run(no_hotspot: bool, no_send: bool) -> Result<()> {
         &sections,
     );
     println!("{report}");
+    info!(
+        failures = failures(&sections),
+        bytes = report.len(),
+        "selftest report ready"
+    );
 
     let key = match upload(&report).await {
         Ok(Some(k)) => {

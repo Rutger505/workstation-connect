@@ -20,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,11 +70,20 @@ struct Ctx {
 
 impl Ctx {
     fn set(&self, f: impl FnOnce(&mut Status)) {
+        let mut mode_change = None;
         self.status.send_if_modified(|s| {
             let before = serde_json::to_string(s).ok();
+            let mode = s.mode;
             f(s);
+            if s.mode != mode {
+                mode_change = Some((mode, s.mode));
+            }
             before != serde_json::to_string(s).ok()
         });
+        // Logged outside the closure: it runs under the channel's lock.
+        if let Some((from, to)) = mode_change {
+            info!(?from, ?to, "mode changed");
+        }
     }
 
     fn mode(&self, mode: Mode) {
@@ -84,6 +93,18 @@ impl Ctx {
     fn error(&self, e: impl std::fmt::Display) {
         let msg = e.to_string();
         warn!("{msg}");
+        self.set(|s| s.error = Some(msg));
+    }
+
+    /// Like [`Ctx::error`] for loops that hit the same error every second: warns only when the
+    /// status error changes.
+    fn error_once(&self, e: impl std::fmt::Display) {
+        let msg = e.to_string();
+        if self.status.borrow().error.as_deref() == Some(msg.as_str()) {
+            trace!("{msg} (again)");
+        } else {
+            warn!("{msg}");
+        }
         self.set(|s| s.error = Some(msg));
     }
 
@@ -122,7 +143,18 @@ fn check(ctx: &Ctx, epoch: u64) -> Result<()> {
     Ok(())
 }
 
-pub async fn run(cfg: Config) -> Result<()> {
+pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
+    info!(
+        version = crate::update::VERSION,
+        phone = %cfg.phone,
+        hotspot = %cfg.hotspot_connection,
+        offline_secs = cfg.offline_secs,
+        ignore_ssids = cfg.ignore_ssids.len(),
+        kdeconnect_device = cfg.kdeconnect_device.is_some(),
+        auto_update = cfg.auto_update,
+        log = log_filter,
+        "workstation-connect daemon starting"
+    );
     for key in cfg.obsolete_keys() {
         warn!("config: `{key}` is obsolete (Bluetooth tethering is gone), ignored: remove it");
     }
@@ -155,6 +187,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         uploader: Uploader::spawn(),
     });
     info!("workstation-connect {} started", crate::update::VERSION);
+    debug!(socket = %socket_path().display(), "tasks starting");
     ctx.uploader.trigger(Reason::Start);
 
     // Mirror the phone link into the status.
@@ -165,6 +198,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             let link = *rx.borrow_and_update();
             c.set(|s| s.phone = link);
             if rx.changed().await.is_err() {
+                error!("phone link task gone: status no longer follows the link");
                 break;
             }
         }
@@ -174,15 +208,18 @@ pub async fn run(cfg: Config) -> Result<()> {
     let r = reconnected.clone();
     let auto = ctx.cfg.auto_update;
     let up = ctx.uploader.clone();
-    tokio::spawn(async move {
-        crate::update::watch(
-            auto,
-            |u| c.set(|s| s.update = u),
-            || up.trigger(Reason::Update),
-            &r,
-        )
-        .await
-    });
+    tokio::spawn(
+        async move {
+            crate::update::watch(
+                auto,
+                |u| c.set(|s| s.update = u),
+                || up.trigger(Reason::Update),
+                &r,
+            )
+            .await
+        }
+        .instrument(info_span!("update")),
+    );
     tokio::spawn(link_events(ctx.clone()));
     tokio::spawn(periodic_upload(ctx.clone()));
     tokio::spawn(kde_watch(ctx.clone()));
@@ -211,11 +248,13 @@ pub async fn run(cfg: Config) -> Result<()> {
             Err(e) if e.is::<Aborted>() => info!("{e}"),
             Err(e) => {
                 ctx.error(format!("{e:#}"));
-                let _ = ctx.phone.send(Cmd::Off, Duration::from_secs(5)).await;
+                if let Err(e) = ctx.phone.send(Cmd::Off, Duration::from_secs(5)).await {
+                    warn!("phone off after failure: {e:#}");
+                }
                 ctx.mode(Mode::Cooldown);
                 let mut resumes = ctx.resumes.subscribe();
                 tokio::select! {
-                    _ = sleep(Duration::from_secs(60)) => {}
+                    _ = sleep(Duration::from_secs(60)) => debug!("cooldown over"),
                     _ = resumes.changed() => info!("resumed: cooldown over"),
                 }
             }
@@ -229,14 +268,20 @@ async fn idle(ctx: &Ctx) {
     let threshold = Duration::from_secs(ctx.cfg.offline_secs);
     let mut resumes = ctx.resumes.subscribe();
     let exclude = [ctx.cfg.hotspot_connection.as_str()];
+    // Last decision, so it's logged on change only (the loop runs every second).
+    let mut was_trigger = false;
     loop {
         if *ctx.hold.borrow() {
             ctx.set(|s| {
                 s.mode = Mode::Selftest;
                 s.offline_secs = None;
             });
-            let _ = ctx.hold.subscribe().wait_for(|h| !h).await;
+            debug!("auto logic on hold (selftest)");
+            if let Err(e) = ctx.hold.subscribe().wait_for(|h| !h).await {
+                warn!("hold channel: {e}");
+            }
             timer.reset();
+            was_trigger = false;
             continue;
         }
         if *ctx.paused.borrow() {
@@ -244,8 +289,12 @@ async fn idle(ctx: &Ctx) {
                 s.mode = Mode::Paused;
                 s.offline_secs = None;
             });
-            let _ = ctx.paused.subscribe().wait_for(|p| !p).await;
+            debug!("auto logic paused");
+            if let Err(e) = ctx.paused.subscribe().wait_for(|p| !p).await {
+                warn!("pause channel: {e}");
+            }
             timer.reset();
+            was_trigger = false;
         }
         sleep(Duration::from_secs(1)).await;
         if *ctx.paused.borrow() || *ctx.hold.borrow() {
@@ -253,15 +302,18 @@ async fn idle(ctx: &Ctx) {
         }
         if resumes.has_changed().unwrap_or(false) {
             resumes.mark_unchanged();
+            debug!("resumed: offline timer reset");
             timer.reset(); // pre-suspend scan says nothing about where we woke up
+            was_trigger = false;
         }
         let snap = match ctx.nm.snapshot().await {
             Ok(s) => s,
             Err(e) => {
-                ctx.error(format!("NetworkManager: {e:#}"));
+                ctx.error_once(format!("NetworkManager: {e:#}"));
                 continue;
             }
         };
+        trace!(?snap, "idle poll");
         if ctx.on_hotspot(&snap) {
             info!("already on the phone: taking over");
             return;
@@ -270,6 +322,7 @@ async fn idle(ctx: &Ctx) {
         timer.update(snap.online, snap.connecting, now, threshold);
         if timer.needs_scan(now) {
             ctx.set(|s| s.mode = Mode::Offline);
+            let scan_start = Instant::now();
             let known = match net::known_wifi_visible(&exclude, &ctx.cfg.ignore_ssids).await {
                 Ok(k) => {
                     info!(
@@ -283,10 +336,18 @@ async fn idle(ctx: &Ctx) {
                     Some(k)
                 }
                 Err(e) => {
-                    warn!("offline scan: {e:#}");
+                    warn!(
+                        "offline scan: {e:#} (waiting {}s for NetworkManager instead)",
+                        threshold.as_secs()
+                    );
                     None
                 }
             };
+            debug!(
+                known_in_range = ?known,
+                elapsed_ms = scan_start.elapsed().as_millis() as u64,
+                "offline scan done"
+            );
             now = Instant::now();
             timer.scanned(known, now);
         }
@@ -303,16 +364,37 @@ async fn idle(ctx: &Ctx) {
                 s.error = None;
             }
         });
+        if trigger != was_trigger {
+            debug!(
+                trigger,
+                online = snap.online,
+                connecting = snap.connecting,
+                offline_secs = ?offline,
+                threshold_secs = threshold.as_secs(),
+                "offline decision: {}",
+                if trigger { "ask the phone" } else { "wait" }
+            );
+            was_trigger = trigger;
+        }
         if !trigger {
             continue;
         }
         let link = ctx.phone.link();
         match link.state {
-            Some(st) if link.connected && st.shizuku => return,
-            Some(_) if link.connected => {
-                ctx.error("phone: Shizuku not running (start it via wireless debugging)")
+            Some(st) if link.connected && st.shizuku => {
+                debug!(battery = st.battery, "phone ready: activating");
+                return;
             }
-            _ => ctx.set(|s| s.error = Some("phone not in reach over Bluetooth".into())),
+            Some(_) if link.connected => {
+                ctx.error_once("phone: Shizuku not running (start it via wireless debugging)")
+            }
+            _ => {
+                let msg = "phone not in reach over Bluetooth";
+                if ctx.status.borrow().error.as_deref() != Some(msg) {
+                    info!("offline, but {msg}: waiting for the link");
+                }
+                ctx.set(|s| s.error = Some(msg.into()))
+            }
         }
     }
 }
@@ -364,13 +446,21 @@ async fn try_hotspot(ctx: &Ctx, epoch: u64, within: Duration) -> Result<bool> {
     let deadline = start + within;
     // The phone's hotspot is up ~3 s after "on". The connection probes its SSID directly
     // (hidden = yes), so no waiting for a scan that lists it.
-    ctx.phone
+    let flag = ctx
+        .phone
         .wait_for(Duration::from_secs(10), |s| s.hotspot)
         .await;
-    info!(
-        "phone hotspot flag after {:.1}s",
-        start.elapsed().as_secs_f32()
-    );
+    if flag {
+        info!(
+            "phone hotspot flag after {:.1}s",
+            start.elapsed().as_secs_f32()
+        );
+    } else {
+        warn!(
+            "no phone hotspot flag after {:.1}s: trying to join anyway",
+            start.elapsed().as_secs_f32()
+        );
+    }
     for attempt in 1.. {
         check(ctx, epoch)?;
         match net::up(hotspot, 10).await {
@@ -384,6 +474,11 @@ async fn try_hotspot(ctx: &Ctx, epoch: u64, within: Duration) -> Result<bool> {
             Err(e) => {
                 warn!("hotspot up (attempt {attempt}): {e:#}");
                 if Instant::now() >= deadline {
+                    debug!(
+                        attempts = attempt,
+                        within_secs = within.as_secs(),
+                        "hotspot join: giving up"
+                    );
                     break;
                 }
                 net::rescan().await;
@@ -404,8 +499,10 @@ async fn on_phone(ctx: &Ctx, epoch: u64) -> Result<()> {
         check(ctx, epoch)?;
         let snap = ctx.nm.snapshot().await?;
         if !ctx.on_hotspot(&snap) {
-            warn!("phone connection gone");
-            let _ = ctx.phone.send(Cmd::Off, Duration::from_secs(5)).await;
+            warn!(online = snap.online, "phone connection gone");
+            if let Err(e) = ctx.phone.send(Cmd::Off, Duration::from_secs(5)).await {
+                debug!("phone off after the hotspot dropped: {e:#}");
+            }
             return Ok(()); // idle: asks again if still offline
         }
         ctx.mode(Mode::Hotspot);
@@ -419,12 +516,14 @@ async fn on_phone(ctx: &Ctx, epoch: u64) -> Result<()> {
                     // Each network gets one try per session: no flapping between hotspot and bad Wi-Fi.
                     tried.insert(id.clone());
                     if try_known_wifi(ctx, epoch, &id).await? {
-                        let _ = ctx.phone.send(Cmd::Off, Duration::from_secs(10)).await;
-                        info!("back on {id}: phone off");
+                        match ctx.phone.send(Cmd::Off, Duration::from_secs(10)).await {
+                            Ok(()) => info!("back on {id}: phone off"),
+                            Err(e) => warn!("back on {id}, but phone off failed: {e:#}"),
+                        }
                         return Ok(());
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => debug!(tried = tried.len(), "no known Wi-Fi worth switching to"),
                 Err(e) => warn!("wifi scan: {e:#}"),
             }
         }
@@ -434,16 +533,21 @@ async fn on_phone(ctx: &Ctx, epoch: u64) -> Result<()> {
 /// The Wi-Fi replaces the hotspot on the same radio, so a failure brings the hotspot back.
 async fn try_known_wifi(ctx: &Ctx, epoch: u64, id: &str) -> Result<bool> {
     info!("known Wi-Fi in range: trying {id}");
-    if net::up(id, 20).await.is_ok() {
-        ctx.nm.recheck().await;
-        for _ in 0..15 {
-            check(ctx, epoch)?;
-            let snap = ctx.nm.snapshot().await?;
-            if snap.online && snap.is_active(id) {
-                return Ok(true);
+    let t = Instant::now();
+    match net::up(id, 20).await {
+        Ok(()) => {
+            ctx.nm.recheck().await;
+            for _ in 0..15 {
+                check(ctx, epoch)?;
+                let snap = ctx.nm.snapshot().await?;
+                if snap.online && snap.is_active(id) {
+                    debug!(elapsed_ms = t.elapsed().as_millis() as u64, "{id}: online");
+                    return Ok(true);
+                }
+                sleep(Duration::from_secs(1)).await;
             }
-            sleep(Duration::from_secs(1)).await;
         }
+        Err(e) => warn!("{id} up: {e:#}"),
     }
     warn!("{id} has no internet: back to the hotspot");
     if let Err(e) = net::up(&ctx.cfg.hotspot_connection, 20).await {
@@ -459,8 +563,13 @@ async fn link_events(ctx: Arc<Ctx>) {
         match rx.recv().await {
             Ok(LinkEvent::Connected) => ctx.uploader.trigger(Reason::LinkOk),
             Ok(LinkEvent::GaveUp) => ctx.uploader.trigger(Reason::LinkFail),
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-            Err(_) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                debug!("link events: {n} missed")
+            }
+            Err(_) => {
+                debug!("link events: phone link task gone");
+                break;
+            }
         }
     }
 }
@@ -469,8 +578,10 @@ async fn link_events(ctx: Arc<Ctx>) {
 async fn periodic_upload(ctx: Arc<Ctx>) {
     loop {
         sleep(Duration::from_secs(10 * 60)).await;
-        if ctx.nm.snapshot().await.is_ok_and(|s| s.online) {
-            ctx.uploader.trigger(Reason::Periodic);
+        match ctx.nm.snapshot().await {
+            Ok(s) if s.online => ctx.uploader.trigger(Reason::Periodic),
+            Ok(_) => debug!("periodic upload skipped: offline"),
+            Err(e) => debug!("periodic upload skipped: NetworkManager: {e:#}"),
         }
     }
 }
@@ -524,8 +635,11 @@ async fn reconnect_watch(ctx: Arc<Ctx>, reconnected: Arc<tokio::sync::Notify>) {
             let start = std::time::Instant::now();
             while events.next().await.is_some() {
                 if start.elapsed() > Duration::from_secs(5) {
+                    debug!("network (re)connected: update check, pending uploads");
                     reconnected.notify_one();
                     ctx.uploader.retry();
+                } else {
+                    trace!("reconnect watch: initial value");
                 }
             }
             bail!("NM watch ended")
@@ -548,7 +662,14 @@ async fn wifi_guard(ctx: Arc<Ctx>) {
             let Some(mut prev) = changes.next().await else {
                 bail!("no Wi-Fi state");
             };
+            debug!(wifi = name(&prev.1), "wifi watch started");
             while let Some(new) = changes.next().await {
+                debug!(
+                    from = name(&prev.1),
+                    to = name(&new.1),
+                    left = logic::wifi_left(&prev.0, &new.0),
+                    "wifi connection changed"
+                );
                 if logic::wifi_left(&prev.0, &new.0) {
                     let (old, new) = (name(&prev.1), name(&new.1));
                     tokio::spawn(tell_net_changed(ctx.clone(), format!("{old} → {new}")));
@@ -624,8 +745,10 @@ async fn sleep_guard(ctx: Arc<Ctx>) {
                 )
                 .await?,
         );
+        debug!("sleep guard: delay lock held");
         while let Some(sig) = signals.next().await {
             if sig.args()?.start {
+                info!(on_phone = ctx.on_phone(), "suspending");
                 if ctx.on_phone() {
                     ctx.abort_running();
                     match ctx.phone.send(Cmd::Off, Duration::from_secs(3)).await {
@@ -634,6 +757,7 @@ async fn sleep_guard(ctx: Arc<Ctx>) {
                     }
                 }
                 lock = None; // release: suspend continues
+                debug!("sleep guard: delay lock released");
             } else {
                 info!("resumed");
                 ctx.resumes.send_modify(|n| *n += 1);
@@ -650,13 +774,20 @@ async fn sleep_guard(ctx: Arc<Ctx>) {
                         )
                         .await?,
                 );
+                debug!("sleep guard: delay lock held again");
             }
         }
         Ok(())
     }
     .await;
-    if let Err(e) = res {
-        ctx.error(format!("sleep guard stopped: {e:#}"));
+    // Not retried: suspends no longer turn the phone off first.
+    match res {
+        Ok(()) => error!("sleep guard stopped: logind signal stream ended"),
+        Err(e) => {
+            let msg = format!("sleep guard stopped: {e:#}");
+            error!("{msg}");
+            ctx.set(|s| s.error = Some(msg));
+        }
     }
 }
 
@@ -669,21 +800,40 @@ pub fn socket_path() -> std::path::PathBuf {
 
 async fn serve_socket(ctx: Arc<Ctx>) {
     let path = socket_path();
-    let _ = std::fs::remove_file(&path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => debug!("removed stale socket {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("remove stale socket {}: {e}", path.display()),
+    }
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
-        Err(e) => return ctx.error(format!("socket {}: {e}", path.display())),
+        Err(e) => {
+            // CLI, waybar and selftest can't reach the daemon; automation keeps running.
+            let msg = format!("socket {}: {e}", path.display());
+            error!("{msg}");
+            return ctx.set(|s| s.error = Some(msg));
+        }
     };
+    debug!("listening on {}", path.display());
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                warn!("socket accept: {e}");
+                // Don't spin (and flood the journal) on a persistent error like EMFILE.
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let ctx = ctx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = client(ctx, stream).await {
-                tracing::debug!("client: {e:#}");
+        tokio::spawn(
+            async move {
+                if let Err(e) = client(ctx, stream).await {
+                    debug!("client: {e:#}");
+                }
             }
-        });
+            .instrument(info_span!("ctl")),
+        );
     }
 }
 
@@ -693,8 +843,15 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
     BufReader::new(r).read_line(&mut line).await?;
     if line.trim_start().starts_with('{') {
         let reply = match serde_json::from_str::<CtlReq>(line.trim()) {
-            Ok(req) => handle(&ctx, req).await,
-            Err(e) => serde_json::json!({"error": format!("bad request: {e}")}),
+            Ok(req) => {
+                // Only the command: the request may carry a whole selftest report.
+                debug!(cmd = req.name(), "ctl request");
+                handle(&ctx, req).await
+            }
+            Err(e) => {
+                warn!(len = line.len(), "ctl: bad JSON request: {e}");
+                serde_json::json!({"error": format!("bad request: {e}")})
+            }
         };
         w.write_all(format!("{reply}\n").as_bytes()).await?;
         return Ok(());
@@ -726,6 +883,10 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
         info!("paused: {on}");
     };
     match line.trim() {
+        "watch" | "status" => trace!(cmd = line.trim(), "ctl request"),
+        other => debug!(cmd = other, "ctl request"),
+    }
+    match line.trim() {
         "status" => {}
         "pause" => pause(true),
         "resume" => pause(false),
@@ -742,7 +903,10 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
                 rx.changed().await?;
             }
         }
-        other => bail!("unknown command {other:?}"),
+        other => {
+            warn!("ctl: unknown command {other:?}");
+            bail!("unknown command {other:?}")
+        }
     }
     let s = serde_json::to_string(&*ctx.status.borrow())?;
     w.write_all(format!("{s}\n").as_bytes()).await?;
@@ -763,13 +927,26 @@ enum CtlReq {
     },
 }
 
+impl CtlReq {
+    fn name(&self) -> &'static str {
+        match self {
+            CtlReq::SelftestLink => "selftest_link",
+            CtlReq::SelftestHotspot => "selftest_hotspot",
+            CtlReq::Upload { .. } => "upload",
+        }
+    }
+}
+
 async fn handle(ctx: &Arc<Ctx>, req: CtlReq) -> serde_json::Value {
     use serde_json::json;
     match req {
         CtlReq::SelftestLink => json!({"steps": selftest_link(ctx).await}),
         CtlReq::SelftestHotspot => json!({"steps": selftest_hotspot(ctx).await}),
         CtlReq::Upload { reason, report } => match Reason::parse(&reason) {
-            None => json!({"error": format!("unknown reason {reason:?}")}),
+            None => {
+                warn!("ctl upload: unknown reason {reason:?}");
+                json!({"error": format!("unknown reason {reason:?}")})
+            }
             Some(r) => match ctx.uploader.now(r, report).await {
                 Ok(key) => json!({"key": key}),
                 Err(e) => json!({"error": format!("{e:#}")}),
@@ -800,6 +977,7 @@ async fn selftest_link(ctx: &Ctx) -> Vec<Step> {
                 (None, Some(e)) => e,
                 (None, None) => "no error recorded".into(),
             };
+            warn!("selftest: phone link not connected after 30 s: {why}");
             steps.push(Step::fail(
                 "connect now",
                 Some(t),
@@ -809,13 +987,19 @@ async fn selftest_link(ctx: &Ctx) -> Vec<Step> {
         }
     }
     steps.push(match ctx.phone.ping(Duration::from_secs(5)).await {
-        Ok(rtt) => Step::new(
-            "ping round trip",
-            Res::Pass,
-            Some(rtt.as_millis() as u64),
-            "state frame back",
-        ),
-        Err(e) => Step::fail("ping round trip", None, format!("{e:#}")),
+        Ok(rtt) => {
+            info!(rtt_ms = rtt.as_millis() as u64, "selftest: ping answered");
+            Step::new(
+                "ping round trip",
+                Res::Pass,
+                Some(rtt.as_millis() as u64),
+                "state frame back",
+            )
+        }
+        Err(e) => {
+            warn!("selftest: ping: {e:#}");
+            Step::fail("ping round trip", None, format!("{e:#}"))
+        }
     });
     match ctx.phone.link().state {
         Some(st) => {
@@ -871,10 +1055,12 @@ async fn selftest_hotspot(ctx: &Arc<Ctx>) -> Vec<Step> {
                 .map(|c| c.id.clone()),
         ),
         Err(e) => {
+            warn!("selftest: NetworkManager: {e:#}");
             steps.push(Step::fail("NetworkManager", None, format!("{e:#}")));
             (false, None)
         }
     };
+    debug!(was_on_hotspot, previous = ?previous, "selftest: network before");
     steps.push(Step::pass(
         "before",
         None,
@@ -892,6 +1078,7 @@ async fn selftest_hotspot(ctx: &Arc<Ctx>) -> Vec<Step> {
     .await
     .is_err()
     {
+        warn!("selftest: hotspot test timed out after 60 s");
         steps.push(Step::fail("hotspot test", Some(t), "timed out after 60 s"));
     }
     if was_on_hotspot {
@@ -906,7 +1093,10 @@ async fn selftest_hotspot(ctx: &Arc<Ctx>) -> Vec<Step> {
                 .await
                 .map(|()| "sent".into()),
         ));
-        let _ = net::down(&hotspot).await; // usually gone already with the phone's hotspot
+        // Usually gone already with the phone's hotspot: an error is expected.
+        if let Err(e) = net::down(&hotspot).await {
+            debug!("selftest: hotspot down: {e:#}");
+        }
         match &previous {
             Some(p) => {
                 let t = Instant::now();
@@ -920,7 +1110,8 @@ async fn selftest_hotspot(ctx: &Arc<Ctx>) -> Vec<Step> {
         }
     }
     ctx.hold.send_replace(false);
-    info!("selftest: hotspot test done, auto logic back");
+    let failed = steps.iter().filter(|s| s.res == Res::Fail).count();
+    info!(failed, "selftest: hotspot test done, auto logic back");
     steps
 }
 
@@ -984,7 +1175,9 @@ async fn hotspot_steps(ctx: &Ctx, hotspot: &str, already: bool, steps: &mut Vec<
             Ok(Err(e)) => last = e,
             Err(e) => last = e.into(),
         }
+        trace!("selftest: internet check: {last:#}");
         if t.elapsed() > Duration::from_secs(15) {
+            warn!("selftest: no internet over the hotspot: {last:#}");
             steps.push(Step::fail("internet", Some(t), format!("{last:#}")));
             break;
         }

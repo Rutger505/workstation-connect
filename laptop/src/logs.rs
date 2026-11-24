@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, trace, warn};
 
 const ENDPOINT_HOST: &str = "cdn.rutgerpronk.com";
 const BUCKET: &str = "wsconnect-logs";
@@ -134,6 +134,8 @@ pub fn write_key(access: &str, secret: &str) -> Result<()> {
     // mode() only applies to new files.
     f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     writeln!(f, "{ACCESS_VAR}={access}\n{SECRET_VAR}={secret}")?;
+    // Never the keys themselves.
+    info!("log upload key written to {}", path.display());
     println!(
         "wrote {} (mode 600); the daemon uses it from the next upload",
         path.display()
@@ -179,6 +181,7 @@ fn iso(secs: u64) -> String {
 pub fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
+        .map_err(|e| debug!("hostname: {e}"))
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into())
@@ -187,7 +190,18 @@ pub fn hostname() -> String {
 fn kernel() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".into())
+        .unwrap_or_else(|e| {
+            debug!("kernel release: {e}");
+            "unknown".into()
+        })
+}
+
+/// New journal lines worth a periodic upload: the uploader's own lines (debug level) don't
+/// count, else every upload would cause the next one.
+pub fn has_new_lines(journal: &str) -> bool {
+    journal
+        .lines()
+        .any(|l| !l.trim().is_empty() && !l.contains(" workstation_connect::logs: "))
 }
 
 /// laptop/<hostname>/<YYYY-MM-DD>/<HHMMSS>-<reason>.log (UTC)
@@ -305,10 +319,13 @@ async fn system_journal(since: &str) -> String {
         cmd.args(&args)
             .args(["-o", "short-precise", "--no-pager", "-q"])
             .arg(format!("--since={since}"));
-        if let Ok((_, lines, _)) = run(&mut cmd).await
-            && !lines.trim().is_empty()
-        {
-            out.push_str(&format!("\n===== system journal: {name} =====\n{lines}"));
+        match run(&mut cmd).await {
+            Ok((_, lines, _)) if !lines.trim().is_empty() => {
+                out.push_str(&format!("\n===== system journal: {name} =====\n{lines}"));
+            }
+            // No access (not in systemd-journal/wheel) or nothing new: expected, best effort.
+            Ok((ok, _, err)) => trace!(ok, "system journal {name}: empty: {}", err.trim()),
+            Err(e) => debug!("system journal {name}: {e:#}"),
         }
     }
     out
@@ -322,10 +339,14 @@ struct Payload {
 
 async fn build(reasons: &[Reason], extra: Option<&str>, now: u64) -> Result<Payload> {
     let path = cursor_path();
-    let saved = std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let saved = match std::fs::read_to_string(&path) {
+        Ok(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!("log upload: read {}: {e}: starting fresh", path.display());
+            None
+        }
+    };
     // Cursor file mtime = last successful upload: the system journal starts there.
     let since = std::fs::metadata(&path)
         .and_then(|m| m.modified())
@@ -342,8 +363,15 @@ async fn build(reasons: &[Reason], extra: Option<&str>, now: u64) -> Result<Payl
         }
         Err(e) => return Err(e),
     };
-    let new_lines = !user.trim().is_empty();
+    let new_lines = has_new_lines(&user);
     let system = system_journal(&since).await;
+    debug!(
+        cursor = saved.is_some(),
+        user_bytes = user.len(),
+        system_bytes = system.len(),
+        new_lines,
+        "log upload: journal read"
+    );
     let names: Vec<_> = reasons.iter().map(|r| r.as_str()).collect();
     let mut head = format!(
         "host: {}\nworkstation-connect: {}\nkernel: {}\nreason: {}\ntime: {}\njournal since: {}\n",
@@ -417,7 +445,10 @@ fn put_blocking(creds: &Credentials, key: &str, body: String) -> Result<()> {
         .context("PUT")?;
     let status = res.status();
     if !status.is_success() {
-        let text = res.body_mut().read_to_string().unwrap_or_default();
+        let text = res.body_mut().read_to_string().unwrap_or_else(|e| {
+            debug!("log upload: error body unreadable: {e}");
+            String::new()
+        });
         bail!(
             "PUT {key}: HTTP {status}: {}",
             text.chars().take(300).collect::<String>()
@@ -445,9 +476,11 @@ pub async fn upload(reasons: &[Reason], extra: Option<&str>) -> Result<Option<St
     let key = object_key(&hostname(), reason, now);
     let size = p.body.len();
     let k = key.clone();
+    let t = std::time::Instant::now();
     tokio::task::spawn_blocking(move || put_blocking(&creds, &k, p.body))
         .await
         .context("upload task")??;
+    let elapsed_ms = t.elapsed().as_millis() as u64;
     if let Some(c) = p.cursor {
         let res = std::fs::create_dir_all(crate::config::state_dir())
             .and_then(|()| std::fs::write(cursor_path(), c));
@@ -456,7 +489,7 @@ pub async fn upload(reasons: &[Reason], extra: Option<&str>) -> Result<Option<St
         }
     }
     // debug, not info: an info line per upload would be "new lines" for the next periodic one.
-    debug!("log upload: {key} ({size} bytes)");
+    debug!(elapsed_ms, "log upload: {key} ({size} bytes)");
     Ok(Some(key))
 }
 
@@ -480,18 +513,30 @@ pub struct Uploader {
 impl Uploader {
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(serve(rx));
+        tokio::spawn(serve(rx).instrument(info_span!("log_upload")));
         Self { tx }
+    }
+
+    fn queue(&self, job: Job, what: &str) {
+        match self.tx.try_send(job) {
+            Ok(()) => debug!("log upload: {what} queued"),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("log upload: queue full, {what} dropped")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("log upload: uploader gone, {what} dropped")
+            }
+        }
     }
 
     /// Upload soon (debounced), also when nothing new happened since the last one (except periodic).
     pub fn trigger(&self, reason: Reason) {
-        let _ = self.tx.try_send(Job::Trigger(reason));
+        self.queue(Job::Trigger(reason), reason.as_str());
     }
 
     /// Network back: retry uploads that failed (if any).
     pub fn retry(&self) {
-        let _ = self.tx.try_send(Job::Retry);
+        self.queue(Job::Retry, "retry");
     }
 
     /// Upload right away with `extra` after the header; returns the object key.
@@ -556,10 +601,15 @@ async fn serve(mut rx: mpsc::Receiver<Job>) {
                 if let Err(e) = &r {
                     warn!("log upload ({}): {e:#}", reason.as_str());
                 }
-                let _ = reply.send(r);
+                if reply.send(r).is_err() {
+                    debug!("log upload ({}): requester gone", reason.as_str());
+                }
                 continue;
             }
-            Job::Retry if pending.is_empty() => continue,
+            Job::Retry if pending.is_empty() => {
+                trace!("log upload: retry, nothing pending");
+                continue;
+            }
             Job::Retry => {}
             Job::Trigger(r) => merge(&mut pending, r),
         }
@@ -573,6 +623,8 @@ async fn serve(mut rx: mpsc::Receiver<Job>) {
                 j @ Job::Now { .. } => now_jobs.push(j),
             }
         }
+        let names: Vec<_> = pending.iter().map(|r| r.as_str()).collect();
+        debug!(reasons = %names.join(","), "log upload: debounce over, uploading");
         match attempt(&pending, None, &mut off_logged).await {
             Ok(_) => pending.clear(),
             Err(e) => {
@@ -591,7 +643,13 @@ async fn serve(mut rx: mpsc::Receiver<Job>) {
                 reply,
             } = job
             {
-                let _ = reply.send(attempt(&[reason], extra.as_deref(), &mut off_logged).await);
+                let r = attempt(&[reason], extra.as_deref(), &mut off_logged).await;
+                if let Err(e) = &r {
+                    warn!("log upload ({}): {e:#}", reason.as_str());
+                }
+                if reply.send(r).is_err() {
+                    debug!("log upload ({}): requester gone", reason.as_str());
+                }
             }
         }
     }
@@ -640,6 +698,17 @@ mod tests {
         assert_eq!(body, "a\nb\n");
         assert_eq!(c.as_deref(), Some("s=1;i=2"));
         assert_eq!(split_cursor(""), (String::new(), None));
+    }
+
+    #[test]
+    fn own_lines_are_not_new() {
+        assert!(!has_new_lines(""));
+        assert!(!has_new_lines(
+            "Nov 23 20:45:24.1 host workstation-connect[1]: DEBUG log_upload: workstation_connect::logs: log upload: x\n"
+        ));
+        assert!(has_new_lines(
+            "Nov 23 20:45:24.1 host workstation-connect[1]:  INFO workstation_connect::daemon: resumed\n"
+        ));
     }
 
     #[test]

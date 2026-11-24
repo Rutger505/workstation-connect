@@ -2,8 +2,9 @@
 
 use anyhow::{Context, Result, bail};
 use futures::{Stream, StreamExt};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tracing::{debug, trace};
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -108,16 +109,31 @@ impl Nm {
             active: Vec::new(),
         };
         for path in nm.active_connections().await? {
-            let Ok(builder) = ActiveConnectionProxy::builder(&self.bus).path(path) else {
-                continue;
+            let builder = match ActiveConnectionProxy::builder(&self.bus).path(path.clone()) {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!("active connection {path}: {e}");
+                    continue;
+                }
             };
             // Connections vanish between listing and reading; skip those.
-            let Ok(ac) = builder.cache_properties(CacheProperties::No).build().await else {
-                continue;
+            let ac = match builder.cache_properties(CacheProperties::No).build().await {
+                Ok(ac) => ac,
+                Err(e) => {
+                    trace!("active connection {path} gone: {e}");
+                    continue;
+                }
             };
-            let (Ok(id), Ok(kind), Ok(st)) = (ac.id().await, ac.kind().await, ac.state().await)
-            else {
-                continue;
+            let (id, kind, st) = match (ac.id().await, ac.kind().await, ac.state().await) {
+                (Ok(id), Ok(kind), Ok(st)) => (id, kind, st),
+                (id, kind, st) => {
+                    let e = [id.err(), kind.err(), st.err()]
+                        .into_iter()
+                        .flatten()
+                        .next();
+                    trace!("active connection {path} unreadable (gone?): {e:?}");
+                    continue;
+                }
             };
             snap.connecting |= st == ACTIVE_ACTIVATING;
             snap.active.push(ActiveConn { id, kind });
@@ -133,9 +149,15 @@ impl Nm {
         let full = nm
             .receive_connectivity_changed()
             .await
-            .filter_map(
-                |c| async move { (c.get().await.ok()? == CONNECTIVITY_FULL).then_some(()) },
-            );
+            .filter_map(|c| async move {
+                match c.get().await {
+                    Ok(v) => (v == CONNECTIVITY_FULL).then_some(()),
+                    Err(e) => {
+                        debug!("connectivity change unreadable: {e}");
+                        None
+                    }
+                }
+            });
         Ok(futures::stream::select(primary, full))
     }
 
@@ -152,10 +174,15 @@ impl Nm {
             }
         }
         let dev = wifi.context("no Wi-Fi device")?;
+        debug!(device = %dev.inner().path(), "watching Wi-Fi device");
         let changes = dev.receive_active_connection_changed().await;
         Ok(changes.then(move |c| async move {
-            let Ok(path) = c.get().await else {
-                return ("/".to_string(), String::new());
+            let path = match c.get().await {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("Wi-Fi active connection unreadable, assuming none: {e}");
+                    return ("/".to_string(), String::new());
+                }
             };
             let id = self.active_id(&path).await.unwrap_or_else(|| "?".into());
             (path.to_string(), id)
@@ -166,31 +193,45 @@ impl Nm {
         if path.as_str() == "/" {
             return Some(String::new());
         }
-        let ac = ActiveConnectionProxy::builder(&self.bus)
-            .path(path.clone())
-            .ok()?
-            .cache_properties(CacheProperties::No)
-            .build()
-            .await
-            .ok()?;
-        ac.id().await.ok()
+        let res: Result<String> = async {
+            let ac = ActiveConnectionProxy::builder(&self.bus)
+                .path(path.clone())?
+                .cache_properties(CacheProperties::No)
+                .build()
+                .await?;
+            Ok(ac.id().await?)
+        }
+        .await;
+        res.map_err(|e| debug!("active connection {path}: id unreadable: {e:#}"))
+            .ok()
     }
 
     /// Ask NM to re-run its connectivity check now (it otherwise waits up to 5 min).
     pub async fn recheck(&self) {
-        if let Ok(nm) = self.manager().await {
-            let _ = nm.check_connectivity().await;
+        let res =
+            async { Ok::<_, anyhow::Error>(self.manager().await?.check_connectivity().await?) }
+                .await;
+        match res {
+            Ok(c) => debug!(connectivity = c, "NetworkManager connectivity rechecked"),
+            Err(e) => debug!("NetworkManager connectivity recheck: {e:#}"),
         }
     }
 }
 
 async fn nmcli(args: &[&str], timeout: Duration) -> Result<String> {
+    let t = Instant::now();
     let out = tokio::time::timeout(
         timeout,
         Command::new("nmcli").args(args).kill_on_drop(true).output(),
     )
     .await
     .with_context(|| format!("nmcli {} timed out", args.join(" ")))??;
+    trace!(
+        args = %args.join(" "),
+        status = %out.status,
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "nmcli"
+    );
     if !out.status.success() {
         bail!(
             "nmcli {}: {}",
@@ -203,11 +244,17 @@ async fn nmcli(args: &[&str], timeout: Duration) -> Result<String> {
 
 pub async fn up(id: &str, wait_secs: u64) -> Result<()> {
     let wait = wait_secs.to_string();
+    let t = Instant::now();
+    debug!("connection up: {id}");
     nmcli(
         &["--wait", &wait, "connection", "up", "id", id],
         Duration::from_secs(wait_secs + 5),
     )
     .await?;
+    debug!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "connection up: {id}: done"
+    );
     Ok(())
 }
 
@@ -226,6 +273,7 @@ pub async fn ensure_hidden(id: &str) -> Result<()> {
         Duration::from_secs(10),
     )
     .await?;
+    debug!(hidden = out.trim(), "{id}: 802-11-wireless.hidden");
     if out.trim() != "yes" {
         nmcli(
             &[
@@ -244,11 +292,16 @@ pub async fn ensure_hidden(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Best effort: NM refuses while a scan runs ("Scanning not allowed"), which is fine.
 pub async fn rescan() {
-    let _ = nmcli(&["device", "wifi", "rescan"], Duration::from_secs(10)).await;
+    match nmcli(&["device", "wifi", "rescan"], Duration::from_secs(10)).await {
+        Ok(_) => debug!("wifi rescan requested"),
+        Err(e) => debug!("wifi rescan: {e:#}"),
+    }
 }
 
 pub async fn down(id: &str) -> Result<()> {
+    debug!("connection down: {id}");
     nmcli(&["connection", "down", "id", id], Duration::from_secs(15)).await?;
     Ok(())
 }
@@ -258,16 +311,36 @@ pub async fn known_wifi_in_range(
     exclude_ids: &[&str],
     exclude_ssids: &[String],
 ) -> Result<Option<String>> {
+    let t = Instant::now();
     let saved = saved_wifi(exclude_ids).await?;
     let scan = scan().await?;
-    Ok(pick_known(&saved, &scan, exclude_ssids, MIN_SIGNAL))
+    let pick = pick_known(&saved, &scan, exclude_ssids, MIN_SIGNAL);
+    debug!(
+        saved = saved.len(),
+        visible = scan.lines().count(),
+        min_signal = MIN_SIGNAL,
+        pick = ?pick,
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "known Wi-Fi scan"
+    );
+    Ok(pick)
 }
 
 /// Any saved Wi-Fi network (not excluded) in range at all, i.e. NM may still join one by itself.
 pub async fn known_wifi_visible(exclude_ids: &[&str], exclude_ssids: &[String]) -> Result<bool> {
+    let t = Instant::now();
     let saved = saved_wifi(exclude_ids).await?;
     let scan = scan().await?;
-    Ok(pick_known(&saved, &scan, exclude_ssids, 0).is_some())
+    let pick = pick_known(&saved, &scan, exclude_ssids, 0);
+    debug!(
+        saved = saved.len(),
+        visible = scan.lines().count(),
+        pick = ?pick,
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "saved Wi-Fi visibility scan"
+    );
+    trace!(scan = %scan.trim(), "scan result");
+    Ok(pick.is_some())
 }
 
 const NMCLI_SLOW: Duration = Duration::from_secs(20);

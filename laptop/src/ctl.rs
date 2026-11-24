@@ -9,14 +9,25 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::watch;
+use tracing::{debug, trace, warn};
 
 pub async fn request(cmd: &str) -> Result<String> {
+    let t = std::time::Instant::now();
+    // JSON requests may carry a whole report: log only their size.
+    let what = if cmd.starts_with('{') { "json" } else { cmd };
     let mut s = UnixStream::connect(socket_path())
         .await
         .context("daemon not running (systemctl --user status workstation-connect)")?;
     s.write_all(format!("{cmd}\n").as_bytes()).await?;
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).await?;
+    debug!(
+        cmd = what,
+        len = cmd.len(),
+        answer_len = line.len(),
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "daemon request"
+    );
     Ok(line.trim().to_string())
 }
 
@@ -52,15 +63,35 @@ pub async fn waybar() -> Result<()> {
     let (daemon_tx, mut daemon_rx) = watch::channel::<Option<Value>>(None);
     tokio::spawn(async move {
         loop {
-            if let Ok(mut s) = UnixStream::connect(socket_path()).await
-                && s.write_all(b"watch\n").await.is_ok()
-            {
-                let mut lines = BufReader::new(s).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                        daemon_tx.send_replace(Some(v));
+            match UnixStream::connect(socket_path()).await {
+                Ok(mut s) => match s.write_all(b"watch\n").await {
+                    Ok(()) => {
+                        debug!("waybar: watching the daemon");
+                        let mut lines = BufReader::new(s).lines();
+                        loop {
+                            match lines.next_line().await {
+                                Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
+                                    Ok(v) => {
+                                        trace!("waybar: daemon status");
+                                        daemon_tx.send_replace(Some(v));
+                                    }
+                                    Err(e) => warn!("waybar: bad status line from daemon: {e}"),
+                                },
+                                Ok(None) => {
+                                    debug!("waybar: daemon closed the watch");
+                                    break;
+                                }
+                                Err(e) => {
+                                    debug!("waybar: daemon watch: {e}");
+                                    break;
+                                }
+                            }
+                        }
                     }
-                }
+                    Err(e) => debug!("waybar: watch request: {e}"),
+                },
+                // Daemon not running: the module says so; retried every 5 s.
+                Err(e) => trace!("waybar: daemon socket: {e}"),
             }
             daemon_tx.send_replace(None);
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -69,7 +100,13 @@ pub async fn waybar() -> Result<()> {
 
     let (kde_tx, mut kde_rx) = watch::channel(KdeView::Unknown);
     tokio::spawn(async move {
-        let want = Config::load().ok().and_then(|c| c.kdeconnect_device);
+        let want = match Config::load() {
+            Ok(c) => c.kdeconnect_device,
+            Err(e) => {
+                warn!("waybar: {e:#}: KDE Connect device from defaults");
+                None
+            }
+        };
         let mut kde = None;
         loop {
             let view = kde_view(&mut kde, want.as_deref()).await;
@@ -78,6 +115,9 @@ pub async fn waybar() -> Result<()> {
             }
             kde_tx.send_if_modified(|old| {
                 if *old != view {
+                    if let KdeView::Error(e) = &view {
+                        debug!("waybar: kde connect: {e}");
+                    }
                     *old = view;
                     true
                 } else {

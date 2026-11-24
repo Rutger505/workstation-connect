@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use std::path::PathBuf;
+use tracing::debug;
 
 /// ~/.config/workstation-connect/config.toml
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +34,9 @@ pub struct Config {
     pub auto_update: bool,
     /// Folder for files/photos shared from the phone (`workstation-connect setup` applies it), e.g. "~/Pictures/Phone".
     pub share_dir: Option<String>,
+    /// Daemon log filter: a level ("debug": workstation-connect only) or EnvFilter directives
+    /// ("workstation_connect=debug,zbus=info"). RUST_LOG wins. Default: info.
+    pub log_level: Option<String>,
 }
 
 fn default_offline_secs() -> u64 {
@@ -70,7 +74,10 @@ impl Config {
         let path = dir().join("config.toml");
         let text =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
+        let cfg: Self =
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        debug!(path = %path.display(), "config loaded");
+        Ok(cfg)
     }
 
     /// Obsolete keys present in the file (ignored; worth a warning).
@@ -101,6 +108,7 @@ hotspot_connection = "Pixel 9 hotspot""#,
         assert!(c.ignore_ssids.is_empty());
         assert!(c.auto_update);
         assert!(c.obsolete_keys().is_empty());
+        assert!(c.log_level.is_none());
     }
 
     #[test]

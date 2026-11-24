@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 pub const COMMIT: &str = env!("WSCONNECT_COMMIT");
 pub const COMMIT_SHORT: &str = env!("WSCONNECT_COMMIT_SHORT");
@@ -124,6 +124,7 @@ async fn latest_main() -> Result<String> {
 /// GitHub compare API: does `latest` have laptop/ changes the install lacks? Err: unknown
 /// (network, rate limit, commit not on GitHub).
 fn compare_blocking(installed: &str, latest: &str) -> Result<bool> {
+    debug!(installed, latest, "GitHub compare API");
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .user_agent(concat!("workstation-connect/", env!("CARGO_PKG_VERSION")))
@@ -134,6 +135,11 @@ fn compare_blocking(installed: &str, latest: &str) -> Result<bool> {
         &format!("https://api.github.com/repos/{REPO}/compare/{installed}...{latest}"),
         "application/vnd.github+json",
     )?)?;
+    debug!(
+        status = compare["status"].as_str().unwrap_or("?"),
+        files = compare["files"].as_array().map_or(0, Vec::len),
+        "GitHub compare answer"
+    );
     Ok(outdated(&compare))
 }
 
@@ -167,7 +173,21 @@ fn failed_path() -> PathBuf {
 }
 
 fn load_failed() -> Option<Failed> {
-    Failed::parse(&std::fs::read_to_string(failed_path()).ok()?)
+    let path = failed_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!("read {}: {e}", path.display());
+            return None;
+        }
+    };
+    let f = Failed::parse(&text);
+    match &f {
+        Some(f) => debug!(target_sha = %f.target, "last failed auto-update loaded"),
+        None => warn!("{}: unreadable, ignored", path.display()),
+    }
+    f
 }
 
 fn save_failed(f: &Failed) {
@@ -191,7 +211,10 @@ pub fn may_install(target: &str, failed: Option<&Failed>, now: SystemTime) -> bo
 
 /// The running binary; after `cargo install` replaced it, /proc reports "<path> (deleted)".
 fn current_exe() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| "workstation-connect".into());
+    let exe = std::env::current_exe().unwrap_or_else(|e| {
+        debug!("current exe unknown ({e}): workstation-connect from PATH");
+        "workstation-connect".into()
+    });
     match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
         Some(s) => s.into(),
         None => exe,
@@ -199,11 +222,20 @@ fn current_exe() -> PathBuf {
 }
 
 async fn unit_active() -> bool {
-    Command::new("systemctl")
+    match Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", UNIT])
         .status()
         .await
-        .is_ok_and(|s| s.success())
+    {
+        Ok(s) => {
+            trace!(active = s.success(), "{UNIT} state");
+            s.success()
+        }
+        Err(e) => {
+            warn!("systemctl --user is-active {UNIT}: {e}");
+            false
+        }
+    }
 }
 
 /// Starts `workstation-connect update` as transient user unit; returns once queued.
@@ -230,6 +262,7 @@ async fn start_unit() -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
+    debug!("{UNIT} started");
     Ok(())
 }
 
@@ -239,10 +272,15 @@ async fn wait_unit() -> Result<()> {
     let start = std::time::Instant::now();
     while unit_active().await {
         if start.elapsed() > MAX_UPDATE {
-            let _ = Command::new("systemctl")
+            match Command::new("systemctl")
                 .args(["--user", "stop", UNIT])
                 .status()
-                .await;
+                .await
+            {
+                Ok(s) if s.success() => {}
+                Ok(s) => warn!("systemctl --user stop {UNIT}: {s}"),
+                Err(e) => warn!("systemctl --user stop {UNIT}: {e}"),
+            }
             bail!(
                 "still running after {} min: stopped",
                 MAX_UPDATE.as_secs() / 60
@@ -286,10 +324,14 @@ pub async fn watch(
     let mut checked: Option<(String, bool)> = None;
     let mut failed = load_failed();
     loop {
+        debug!("checking for updates");
         let res = match latest_main().await {
             Ok(latest) if latest == COMMIT => Ok((latest, false)),
             Ok(latest) => match &checked {
-                Some((sha, out)) if *sha == latest => Ok((latest, *out)),
+                Some((sha, out)) if *sha == latest => {
+                    debug!(latest = %short(&latest), outdated = *out, "main unchanged since the last compare");
+                    Ok((latest, *out))
+                }
                 _ => {
                     let l = latest.clone();
                     match tokio::task::spawn_blocking(move || compare_blocking(COMMIT, &l)).await {
@@ -298,7 +340,7 @@ pub async fn watch(
                             Ok((latest, out))
                         }
                         Ok(Err(e)) => Err(e),
-                        Err(e) => Err(e.into()),
+                        Err(e) => Err(anyhow::Error::new(e).context("compare task")),
                     }
                 }
             },
@@ -350,10 +392,14 @@ pub async fn watch(
                 EVERY
             }
             Err(e) => {
-                warn!("update check: {e:#}");
+                warn!(
+                    "update check: {e:#}; retrying in {} min",
+                    RETRY.as_secs() / 60
+                );
                 RETRY
             }
         };
+        trace!(wait_secs = wait.as_secs(), "next update check");
         let next = SystemTime::now() + wait;
         while SystemTime::now() < next {
             tokio::select! {
@@ -373,15 +419,20 @@ pub async fn watch(
 
 /// `workstation-connect update`: reinstall from main, restart the daemon if it runs.
 pub async fn run(pause: bool) -> Result<()> {
+    info!(installed = VERSION, "update: installing GitHub main");
+    let t = std::time::Instant::now();
     let r = install().await;
-    if let Err(e) = &r {
-        eprintln!("update failed: {e:#}");
+    match &r {
+        Ok(()) => info!(elapsed_secs = t.elapsed().as_secs(), "update done"),
+        Err(e) => error!(elapsed_secs = t.elapsed().as_secs(), "update failed: {e:#}"),
     }
     if pause {
         // Started from the menu in a fresh terminal: keep it open to read the result.
         println!("\nPress Enter to close");
         let mut s = String::new();
-        let _ = std::io::stdin().read_line(&mut s);
+        if let Err(e) = std::io::stdin().read_line(&mut s) {
+            debug!("stdin: {e}");
+        }
     }
     r
 }
@@ -400,6 +451,8 @@ fn cache_dir() -> std::path::PathBuf {
 }
 
 async fn run_ok(cmd: &mut Command, what: &str) -> Result<()> {
+    let t = std::time::Instant::now();
+    info!("update: {what}");
     let status = cmd
         .status()
         .await
@@ -407,6 +460,10 @@ async fn run_ok(cmd: &mut Command, what: &str) -> Result<()> {
     if !status.success() {
         bail!("{what}: {status}");
     }
+    debug!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "update: {what} done"
+    );
     Ok(())
 }
 
@@ -509,11 +566,18 @@ async fn install() -> Result<()> {
     // TRANSITIONAL: "wsconnect" = pre-rename unit, in case its migration hasn't happened
     // (remove with src/bin/wsconnect.rs).
     for unit in ["workstation-connect", "wsconnect"] {
-        let active = Command::new("systemctl")
+        let active = match Command::new("systemctl")
             .args(["--user", "is-active", "--quiet", unit])
             .status()
             .await
-            .is_ok_and(|s| s.success());
+        {
+            Ok(s) => s.success(),
+            Err(e) => {
+                warn!("systemctl --user is-active {unit}: {e}: not restarting it");
+                false
+            }
+        };
+        debug!(unit, active, "update: daemon state");
         if active {
             let status = Command::new("systemctl")
                 .args(["--user", "restart", unit])

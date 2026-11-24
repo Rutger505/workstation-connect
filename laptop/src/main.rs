@@ -4,6 +4,7 @@ mod config;
 mod ctl;
 mod daemon;
 mod kde;
+mod logging;
 mod logic;
 mod logs;
 mod migrate;
@@ -17,6 +18,7 @@ mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tracing::{debug, error, warn};
 
 /// Laptop side of workstation-connect: phone internet on demand over Bluetooth.
 #[derive(Parser)]
@@ -72,25 +74,57 @@ enum Command {
     },
 }
 
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Command::Daemon => "daemon",
+            Command::Status => "status",
+            Command::Pause => "pause",
+            Command::Resume => "resume",
+            Command::Toggle => "toggle",
+            Command::Waybar => "waybar",
+            Command::Menu => "menu",
+            Command::Clip => "clip",
+            Command::Send { .. } => "send",
+            Command::Browse => "browse",
+            Command::Screen => "screen",
+            Command::Setup => "setup",
+            Command::Selftest { .. } => "selftest",
+            Command::LogsKey { .. } => "logs-key",
+            Command::Update { .. } => "update",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.cmd {
-        Command::Daemon => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "workstation_connect=info".into()),
-                )
-                .without_time() // journald adds timestamps
-                .init();
-            if let migrate::Outcome::HandedOff = migrate::run() {
-                // Conflicts= stops this unit any moment now; keep running if it somehow doesn't.
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                tracing::warn!("migrate: still running in the old unit after the handoff");
-            }
-            daemon::run(config::Config::load()?).await
+    if let Command::Daemon = cli.cmd {
+        // Config first: it may set the log level. Its error is logged right after.
+        let cfg = config::Config::load();
+        let filter = logging::init(
+            logging::Kind::Daemon,
+            cfg.as_ref().ok().and_then(|c| c.log_level.as_deref()),
+        );
+        if let migrate::Outcome::HandedOff = migrate::run() {
+            // Conflicts= stops this unit any moment now; keep running if it somehow doesn't.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            warn!("migrate: still running in the old unit after the handoff");
         }
+        let res = match cfg {
+            Ok(cfg) => daemon::run(cfg, &filter).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = res {
+            error!("daemon stopped: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    logging::init(logging::Kind::Cli, None);
+    debug!(cmd = cli.cmd.name(), version = update::VERSION, "cli");
+    match cli.cmd {
+        Command::Daemon => unreachable!("handled above"),
         Command::Waybar => ctl::waybar().await,
         Command::Menu => actions::menu().await,
         Command::Clip => actions::run(actions::Action::Clipboard, vec![]).await,

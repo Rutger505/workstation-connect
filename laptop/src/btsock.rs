@@ -14,10 +14,28 @@ const STEP: Duration = Duration::from_millis(20);
 /// Waits until a just-connected Bluetooth socket is really connected; the connect's error if it
 /// failed. Not bounded: wrap in a timeout. Cancel-safe (no blocking thread holds the fd).
 pub async fn settled(fd: RawFd) -> io::Result<()> {
+    let start = std::time::Instant::now();
+    let mut polls = 0u32;
     loop {
-        match check(fd)? {
-            Some(()) => return Ok(()),
-            None => tokio::time::sleep(STEP).await,
+        polls += 1;
+        match check(fd) {
+            Ok(Some(())) => {
+                tracing::trace!(
+                    polls,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "bluetooth socket settled"
+                );
+                return Ok(());
+            }
+            Ok(None) => tokio::time::sleep(STEP).await,
+            Err(e) => {
+                tracing::trace!(
+                    polls,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "bluetooth socket connect failed: {e}"
+                );
+                return Err(e);
+            }
         }
     }
 }

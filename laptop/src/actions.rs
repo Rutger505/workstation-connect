@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tracing::{debug, info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
@@ -40,11 +41,18 @@ impl Action {
 }
 
 async fn phone(kde: &Kde) -> Result<String> {
-    let want = Config::load().ok().and_then(|c| c.kdeconnect_device);
+    let want = match Config::load() {
+        Ok(c) => c.kdeconnect_device,
+        Err(e) => {
+            debug!("{e:#}: first paired phone");
+            None
+        }
+    };
     kde.find_phone(want.as_deref()).await
 }
 
 pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
+    info!(?action, files = files.len(), "action");
     if action == Action::Pause {
         println!("{}", crate::ctl::request("toggle").await?);
         return Ok(());
@@ -66,6 +74,7 @@ pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
                 files
             };
             if files.is_empty() {
+                debug!("send files: nothing picked");
                 return Ok(()); // picker cancelled
             }
             let urls = files
@@ -76,6 +85,7 @@ pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
         }
         Action::Browse => {
             let dir = kde.mount(&id).await?;
+            debug!("xdg-open {dir}");
             Command::new("xdg-open")
                 .arg(&dir)
                 .spawn()
@@ -89,7 +99,10 @@ pub async fn run(action: Action, files: Vec<std::path::PathBuf>) -> Result<()> {
 /// One-time kdeconnectd setup for the phone: laptop notifications → phone, Bluetooth link (no shared
 /// network needed), incoming files/photos folder. Safe to re-run.
 pub async fn setup() -> Result<()> {
-    let cfg = Config::load().ok();
+    info!("setup");
+    let cfg = Config::load()
+        .map_err(|e| warn!("{e:#}: setting up without config (share_dir not applied)"))
+        .ok();
     let kde = Kde::connect().await?;
     let id = phone(&kde).await?;
     let p = kde.phone(&id).await?;
@@ -122,7 +135,10 @@ pub async fn setup() -> Result<()> {
             .join("kdeconnect_share");
         std::fs::create_dir_all(&conf)?;
         let file = conf.join("config");
-        let old = std::fs::read_to_string(&file).unwrap_or_default();
+        let old = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+            debug!("{}: {e}: starting empty", file.display());
+            String::new()
+        });
         std::fs::write(
             &file,
             crate::kde::set_ini(&old, "incoming_path", &dir.to_string_lossy()),
@@ -147,10 +163,18 @@ fn expand_home(p: &str) -> std::path::PathBuf {
 
 /// Launcher menu (walker/fuzzel/wofi/rofi in dmenu mode, or config `menu`).
 pub async fn menu() -> Result<()> {
-    let cmd = match Config::load().ok().and_then(|c| c.menu) {
+    let configured = match Config::load() {
+        Ok(c) => c.menu,
+        Err(e) => {
+            debug!("{e:#}: detecting the menu program");
+            None
+        }
+    };
+    let cmd = match configured {
         Some(c) if !c.is_empty() => c,
         _ => detect_menu()?,
     };
+    debug!(menu = ?cmd, "menu");
     let mut child = Command::new(&cmd[0])
         .args(&cmd[1..])
         .stdin(Stdio::piped())
@@ -159,8 +183,13 @@ pub async fn menu() -> Result<()> {
         .with_context(|| format!("start {}", cmd[0]))?;
     let outdated = crate::ctl::request("status")
         .await
+        .map_err(|e| debug!("menu: no daemon status, no update item: {e:#}"))
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|s| {
+            serde_json::from_str::<serde_json::Value>(&s)
+                .map_err(|e| warn!("menu: bad daemon status: {e}"))
+                .ok()
+        })
         // Not while an auto-update runs (its lock would refuse anyway).
         .is_some_and(|v| v["update"].is_object() && v["update"]["state"] != "updating");
     let mut actions = Action::MENU.to_vec();
@@ -179,7 +208,10 @@ pub async fn menu() -> Result<()> {
     let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
     match actions.into_iter().find(|a| a.label() == picked) {
         Some(a) => run(a, vec![]).await,
-        None => Ok(()), // cancelled
+        None => {
+            debug!(status = %out.status, "menu: nothing picked");
+            Ok(()) // cancelled
+        }
     }
 }
 
@@ -197,6 +229,7 @@ fn update_in_terminal() -> Result<()> {
         c.arg("-e");
         c
     };
+    debug!(terminal = ?cmd.get_program(), "update in a terminal");
     cmd.args(args).spawn().context("start terminal")?;
     Ok(())
 }
@@ -234,11 +267,14 @@ async fn pick_files() -> Result<Vec<std::path::PathBuf>> {
         ])
         .output()
         .await?;
-    Ok(String::from_utf8_lossy(&out.stdout)
+    // Exit code 1 = cancelled; only the count is logged (file names are private).
+    let files: Vec<std::path::PathBuf> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| !l.is_empty())
         .map(Into::into)
-        .collect())
+        .collect();
+    debug!(status = %out.status, files = files.len(), "zenity file picker");
+    Ok(files)
 }
 
 /// scrcpy over wireless debugging (already on for Shizuku). Uses an existing adb connection,
@@ -247,7 +283,9 @@ async fn screen() -> Result<()> {
     if !which("scrcpy") || !which("adb") {
         bail!("install scrcpy + android-tools");
     }
-    if !adb_has_device().await? {
+    if adb_has_device().await? {
+        debug!("screen: adb already has a device");
+    } else {
         let out = Command::new("adb")
             .args(["mdns", "services"])
             .output()
@@ -264,7 +302,9 @@ async fn screen() -> Result<()> {
         if !msg.contains("connected") {
             bail!("adb connect {target}: {}", msg.trim());
         }
+        info!("screen: adb connected to {target}");
     }
+    info!("screen: starting scrcpy");
     let status = Command::new("scrcpy")
         .args(["--stay-awake", "--turn-screen-off"])
         .status()

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::time::{sleep, sleep_until, timeout};
-use tracing::{info, warn};
+use tracing::{Instrument, debug, info, info_span, trace, warn};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct Link {
@@ -214,7 +214,8 @@ async fn run(
     let mut missing = 0;
     // Phone's RFCOMM channel from the last SDP lookup; None: look it up.
     let mut channel = None;
-    loop {
+    debug!(%addr, "phone link task started");
+    for n in 1u64.. {
         let started = Instant::now();
         let res = attempt(
             addr,
@@ -225,8 +226,15 @@ async fn run(
             &mut fast_until,
             &events,
         )
+        .instrument(info_span!("link", n))
         .await;
         let was_connected = link.borrow().connected;
+        if was_connected {
+            info!(
+                session_secs = started.elapsed().as_secs(),
+                "phone link down"
+            );
+        }
         let diagnosed = res
             .as_ref()
             .err()
@@ -254,11 +262,19 @@ async fn run(
             burst.reset();
         } else if burst.failed(Instant::now() < fast_until) {
             warn!("phone link: {BURST_FAIL}+ connects failed in a row, backing off");
-            let _ = events.send(LinkEvent::GaveUp);
+            if events.send(LinkEvent::GaveUp).is_err() {
+                trace!("link event GaveUp: no listener");
+            }
         }
         // Commands queued while offline would be stale; fail them now.
         while let Ok((cmd, reply)) = cmds.try_recv() {
-            let _ = reply.send(Err(anyhow!("{cmd:?}: phone disconnected")));
+            debug!("dropping queued {cmd:?}: phone disconnected");
+            if reply
+                .send(Err(anyhow!("{cmd:?}: phone disconnected")))
+                .is_err()
+            {
+                trace!("{cmd:?}: caller gone");
+            }
         }
         if was_connected && started.elapsed() > Duration::from_secs(60) {
             step = 0; // was a real session, not a failing retry
@@ -269,6 +285,12 @@ async fn run(
         } else {
             Duration::from_secs(BACKOFF[step])
         };
+        debug!(
+            delay_secs = delay.as_secs(),
+            fast,
+            "phone link: next attempt in {}s",
+            delay.as_secs()
+        );
         tokio::select! {
             _ = sleep(delay) => if !fast {
                 step = (step + 1).min(BACKOFF.len() - 1);
@@ -306,9 +328,17 @@ async fn attempt(
     let device = adapter.device(addr)?;
     let paired = match timeout(CALL, device.is_paired()).await {
         Err(_) => bail!("paired?: bluetoothd not answering"),
-        Ok(Err(e)) if e.kind == ErrorKind::NotFound => false,
+        Ok(Err(e)) if e.kind == ErrorKind::NotFound => {
+            debug!("bluetoothd doesn't know {addr}: {e}");
+            false
+        }
         Ok(r) => r.context("paired?")?,
     };
+    debug!(
+        paired,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "adapter powered, pairing checked"
+    );
     if !paired {
         return Err(Diagnosed {
             problem: Problem::NotPaired,
@@ -380,7 +410,9 @@ async fn attempt(
         state: Some(state),
         problem: None,
     });
-    let _ = events.send(LinkEvent::Connected);
+    if events.send(LinkEvent::Connected).is_err() {
+        trace!("link event Connected: no listener");
+    }
     info!(
         "phone connected: first state {} ms after RFCOMM connect ({} ms since connect start, {} ms \
          since attempt start): {state:?}",
@@ -399,14 +431,22 @@ async fn attempt(
                 let f = f?;
                 answer_by = None;
                 if f.is_empty() {
+                    trace!("keepalive");
                     continue; // keepalive
                 }
                 match PhoneState::parse(&f) {
-                    Some(s) => link.send_modify(|l| l.state = Some(s)),
+                    Some(s) => {
+                        trace!(?s, "state frame");
+                        if link.borrow().state != Some(s) {
+                            debug!(?s, "phone state changed");
+                        }
+                        link.send_modify(|l| l.state = Some(s))
+                    }
                     None => warn!("phone link: bad state frame {f:?}"),
                 }
             }
             _ = ping.tick() => if answer_by.is_none() {
+                trace!("idle: ping");
                 write(&mut wr, Cmd::Ping).await?;
                 answer_by = Some(tokio::time::Instant::now() + PING_ANSWER);
             },
@@ -421,11 +461,16 @@ async fn attempt(
                 bail!("phone didn't answer a ping: link dead");
             }
             Some((cmd, reply)) = cmds.recv() => {
-                if reply.is_closed() { continue; } // caller gave up
+                if reply.is_closed() {
+                    debug!("{cmd:?}: caller gave up before sending");
+                    continue;
+                }
                 let res = write(&mut wr, cmd).await;
                 info!("sent {cmd:?}: {res:?}");
                 let failed = res.as_ref().err().map(|e| format!("{e:#}"));
-                let _ = reply.send(res);
+                if reply.send(res).is_err() {
+                    debug!("{cmd:?}: caller gone before the result");
+                }
                 if let Some(e) = failed { bail!("{e}"); }
             }
         }
@@ -445,6 +490,7 @@ async fn connect(addr: Address, ch: u8) -> std::io::Result<Stream> {
         key_size: 0,
     })?;
     let stream = sock.connect(SocketAddr::new(addr, ch)).await?;
+    trace!("RFCOMM connect returned, waiting until settled");
     crate::btsock::settled(stream.as_raw_fd()).await?;
     Ok(stream)
 }

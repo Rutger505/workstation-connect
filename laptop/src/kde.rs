@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use tracing::info;
+use tracing::{debug, info, trace};
 use zbus::{Connection, Proxy};
 
 const DEST: &str = "org.kde.kdeconnect";
@@ -96,16 +96,24 @@ impl Kde {
         let ids = self.paired().await?;
         for id in &ids {
             let dev = self.device(id, None, "org.kde.kdeconnect.device").await?;
-            let name: String = dev.get_property("name").await.unwrap_or_default();
-            let kind: String = dev.get_property("type").await.unwrap_or_default();
+            let name: String = dev.get_property("name").await.unwrap_or_else(|e| {
+                debug!("kde connect: {id}: name unreadable: {e}");
+                String::new()
+            });
+            let kind: String = dev.get_property("type").await.unwrap_or_else(|e| {
+                debug!("kde connect: {id}: type unreadable: {e}");
+                String::new()
+            });
             let hit = match want {
                 Some(w) => w == id || w == name,
                 None => kind == "smartphone" || kind == "phone" || kind == "tablet",
             };
+            trace!(%id, %name, %kind, hit, "kde connect: paired device");
             if hit {
                 return Ok(id.clone());
             }
         }
+        debug!(paired = ids.len(), want = ?want, "kde connect: no matching device");
         match want {
             Some(w) => bail!("no paired KDE Connect device '{w}'"),
             None => bail!("no paired phone in KDE Connect: pair it from the phone app first"),
@@ -119,18 +127,27 @@ impl Kde {
         let (mut battery, mut charging, mut network, mut signal) = (None, false, None, None);
         if reachable {
             // Plugin objects only exist while the plugin is loaded: missing = unknown, not an error.
-            if let Ok(b) = self
+            // Polled every few seconds (waybar): trace only.
+            match self
                 .device(id, Some("battery"), "org.kde.kdeconnect.device.battery")
                 .await
             {
-                battery = b
-                    .get_property::<i32>("charge")
-                    .await
-                    .ok()
-                    .filter(|c| *c >= 0);
-                charging = b.get_property("isCharging").await.unwrap_or(false);
+                Ok(b) => {
+                    battery = b
+                        .get_property::<i32>("charge")
+                        .await
+                        .map_err(|e| trace!("kde connect: battery charge: {e}"))
+                        .ok()
+                        .filter(|c| *c >= 0);
+                    charging = b
+                        .get_property("isCharging")
+                        .await
+                        .map_err(|e| trace!("kde connect: battery isCharging: {e}"))
+                        .unwrap_or(false);
+                }
+                Err(e) => trace!("kde connect: battery plugin not loaded: {e:#}"),
             }
-            if let Ok(c) = self
+            match self
                 .device(
                     id,
                     Some("connectivity_report"),
@@ -138,16 +155,21 @@ impl Kde {
                 )
                 .await
             {
-                network = c
-                    .get_property::<String>("cellularNetworkType")
-                    .await
-                    .ok()
-                    .filter(|s| !s.is_empty());
-                signal = c
-                    .get_property::<i32>("cellularNetworkStrength")
-                    .await
-                    .ok()
-                    .filter(|s| *s >= 0);
+                Ok(c) => {
+                    network = c
+                        .get_property::<String>("cellularNetworkType")
+                        .await
+                        .map_err(|e| trace!("kde connect: cellularNetworkType: {e}"))
+                        .ok()
+                        .filter(|s| !s.is_empty());
+                    signal = c
+                        .get_property::<i32>("cellularNetworkStrength")
+                        .await
+                        .map_err(|e| trace!("kde connect: cellularNetworkStrength: {e}"))
+                        .ok()
+                        .filter(|s| *s >= 0);
+                }
+                Err(e) => trace!("kde connect: connectivity_report plugin not loaded: {e:#}"),
             }
         }
         Ok(Phone {
@@ -215,22 +237,30 @@ impl Kde {
             .await?;
         p.call::<_, _, ()>("sendPing", &(message,))
             .await
-            .context("ping plugin sendPing")
+            .context("ping plugin sendPing")?;
+        info!(device = id, "kde connect: ping sent");
+        Ok(())
     }
 
+    /// Content never logged (privacy).
     pub async fn send_clipboard(&self, id: &str) -> Result<()> {
         let p = self
             .device(id, Some("clipboard"), "org.kde.kdeconnect.device.clipboard")
             .await?;
-        Ok(p.call("sendClipboard", &()).await?)
+        p.call::<_, _, ()>("sendClipboard", &()).await?;
+        info!(device = id, "kde connect: clipboard sent");
+        Ok(())
     }
 
-    /// Files as file:// URLs, or http(s) links (opened on the phone).
+    /// Files as file:// URLs, or http(s) links (opened on the phone). Only the count is logged.
     pub async fn share(&self, id: &str, urls: Vec<String>) -> Result<()> {
         let p = self
             .device(id, Some("share"), "org.kde.kdeconnect.device.share")
             .await?;
-        Ok(p.call("shareUrls", &(urls,)).await?)
+        let n = urls.len();
+        p.call::<_, _, ()>("shareUrls", &(urls,)).await?;
+        info!(device = id, files = n, "kde connect: shared");
+        Ok(())
     }
 
     /// Mounts the phone over sftp; returns the mount point.
@@ -238,19 +268,32 @@ impl Kde {
         let p = self
             .device(id, Some("sftp"), "org.kde.kdeconnect.device.sftp")
             .await?;
+        let t = std::time::Instant::now();
         let ok: bool = p.call("mountAndWait", &()).await?;
         if !ok {
-            let err: String = p.call("getMountError", &()).await.unwrap_or_default();
+            let err: String = p.call("getMountError", &()).await.unwrap_or_else(|e| {
+                debug!("kde connect: getMountError: {e}");
+                String::new()
+            });
             bail!("mount failed: {err} (allow file access in the phone app)");
         }
-        Ok(p.call("mountPoint", &()).await?)
+        let dir: String = p.call("mountPoint", &()).await?;
+        info!(
+            device = id,
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "kde connect: mounted at {dir}"
+        );
+        Ok(dir)
     }
 }
 
 impl Kde {
     pub async fn set_plugin(&self, id: &str, plugin: &str, on: bool) -> Result<()> {
         let dev = self.device(id, None, "org.kde.kdeconnect.device").await?;
-        Ok(dev.call("setPluginEnabled", &(plugin, on)).await?)
+        dev.call::<_, _, ()>("setPluginEnabled", &(plugin, on))
+            .await?;
+        info!(device = id, plugin, on, "kde connect: plugin set");
+        Ok(())
     }
 
     /// Link providers as (id, enabled), e.g. ("bluetooth", true).
@@ -262,7 +305,11 @@ impl Kde {
 
     pub async fn set_link_provider(&self, provider: &str, on: bool) -> Result<()> {
         let daemon = self.proxy(ROOT.into(), "org.kde.kdeconnect.daemon").await?;
-        Ok(daemon.call("setLinkProviderState", &(provider, on)).await?)
+        daemon
+            .call::<_, _, ()>("setLinkProviderState", &(provider, on))
+            .await?;
+        debug!(provider, on, "kde connect: link provider set");
+        Ok(())
     }
 }
 
@@ -283,6 +330,7 @@ pub async fn pause_sync(on: bool) -> Result<()> {
             .map(|(id, _)| id)
             .collect();
         if enabled.is_empty() {
+            debug!("kde connect: pause: no link provider enabled, keeping the remembered list");
             return Ok(()); // already paused (or nothing on): keep the remembered list
         }
         std::fs::write(&state, enabled.join("\n"))?;
@@ -291,8 +339,15 @@ pub async fn pause_sync(on: bool) -> Result<()> {
             kde.set_link_provider(id, false).await?;
         }
     } else {
-        let Ok(text) = std::fs::read_to_string(&state) else {
-            return Ok(());
+        let text = match std::fs::read_to_string(&state) {
+            Ok(t) => t,
+            Err(e) => {
+                debug!(
+                    "kde connect: resume: nothing to re-enable ({}: {e})",
+                    state.display()
+                );
+                return Ok(());
+            }
         };
         info!(
             "kde connect: resume: enabling link providers {:?}",

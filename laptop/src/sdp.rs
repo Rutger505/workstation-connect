@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use bluer::l2cap::{SeqPacket, SocketAddr};
 use bluer::{Address, AddressType};
 use std::os::fd::AsRawFd;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 const PSM_SDP: u16 = 1;
@@ -46,19 +47,31 @@ pub async fn rfcomm_channel(addr: Address, service: Uuid) -> Result<u8> {
     crate::btsock::settled(sock.as_raw_fd())
         .await
         .context("SDP connect")?;
-    let mut buf = vec![0u8; sock.recv_mtu().unwrap_or(0).max(672)];
+    let mtu = sock.recv_mtu().unwrap_or_else(|e| {
+        debug!("SDP: recv MTU unknown ({e}), assuming 672");
+        0
+    });
+    let mut buf = vec![0u8; mtu.max(672)];
     let mut lists = Vec::new();
     let mut cont = Vec::new();
     for round in 0..MAX_ROUNDS {
         let tid = round as u16 + 1;
-        sock.send(&request(service, tid, &cont))
-            .await
-            .context("SDP send")?;
+        let req = request(service, tid, &cont);
+        trace!(tid, bytes = req.len(), "SDP request");
+        sock.send(&req).await.context("SDP send")?;
         let n = sock.recv(&mut buf).await.context("SDP receive")?;
+        trace!(tid, bytes = n, "SDP response");
         let (part, next) = parse_response(&buf[..n], tid)?;
         lists.extend_from_slice(part);
         if next.is_empty() {
-            return channel(&lists)?.ok_or_else(|| ServiceNotFound.into());
+            let ch = channel(&lists)?;
+            debug!(
+                rounds = round + 1,
+                bytes = lists.len(),
+                channel = ?ch,
+                "SDP lookup done"
+            );
+            return ch.ok_or_else(|| ServiceNotFound.into());
         }
         cont = next.to_vec();
     }

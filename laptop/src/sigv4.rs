@@ -4,10 +4,20 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Credentials {
     pub access: String,
     pub secret: String,
+}
+
+/// Redacted: credentials must never end up in logs (which get uploaded).
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access", &"<redacted>")
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// What gets signed. `headers`: lowercase names, trimmed values, must include `host` and
@@ -156,6 +166,19 @@ mod tests {
                  Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
             ),
             "{auth}"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_keys() {
+        let c = Credentials {
+            access: "AKIDEXAMPLE".into(),
+            secret: "wJalrXUtnFEMI".into(),
+        };
+        let d = format!("{c:?}");
+        assert!(
+            !d.contains("AKIDEXAMPLE") && !d.contains("wJalrXUtnFEMI"),
+            "{d}"
         );
     }
 
