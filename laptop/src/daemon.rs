@@ -886,15 +886,15 @@ async fn bt_adapter_session(
             ev = session_events.next() => match ev {
                 // Seen gone, even if it's back by the time we re-read the state.
                 Some(SessionEvent::AdapterRemoved(n)) => {
-                    debug!(adapter = n, "bluetooth adapter removed");
+                    info!(adapter = n, "bluetooth adapter removed");
                     watch.observe(false);
                 }
-                Some(SessionEvent::AdapterAdded(n)) => debug!(adapter = n, "bluetooth adapter added"),
+                Some(SessionEvent::AdapterAdded(n)) => info!(adapter = n, "bluetooth adapter added"),
                 None => bail!("bluez adapter event stream ended"),
             },
             on = adapter_events => match on {
                 Some(on) => {
-                    debug!(on, "bluetooth adapter powered changed");
+                    info!(on, "bluetooth adapter powered changed");
                     if !on {
                         watch.observe(false);
                     }
