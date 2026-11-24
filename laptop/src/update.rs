@@ -78,6 +78,57 @@ pub enum UpdateState {
     Failed,
 }
 
+/// Outcome of the last finished update check, in the daemon status as `update_check` (None
+/// before the first check, and for builds without a known commit).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Check {
+    /// Unix seconds when the check finished.
+    pub at: u64,
+    pub outcome: CheckOutcome,
+    /// GitHub main's short commit; None when the check failed.
+    pub latest: Option<String>,
+    /// Why the check failed.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckOutcome {
+    UpToDate,
+    /// GitHub main has `laptop/` changes the install lacks (details in `update`).
+    Outdated,
+    /// Network, rate limit, …: `update` keeps the previous result.
+    Failed,
+}
+
+impl Check {
+    fn new(res: &Result<(String, bool)>, at: SystemTime) -> Self {
+        let at = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        match res {
+            Ok((latest, outdated)) => Self {
+                at,
+                outcome: if *outdated {
+                    CheckOutcome::Outdated
+                } else {
+                    CheckOutcome::UpToDate
+                },
+                latest: Some(short(latest)),
+                error: None,
+            },
+            Err(e) => Self {
+                at,
+                outcome: CheckOutcome::Failed,
+                latest: None,
+                error: Some(format!("{e:#}")),
+            },
+        }
+    }
+}
+
+/// Asks the watch loop to check now; fires once that check's result is in the status (before
+/// an auto-update starts). Dropped unanswered when the loop is gone.
+pub type CheckRequest = tokio::sync::oneshot::Sender<()>;
+
 fn short(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
@@ -309,20 +360,110 @@ async fn wait_unit() -> Result<()> {
     bail!("ended without restarting the daemon (journalctl --user -u {UNIT})")
 }
 
-/// Daemon task: reports the outdated state on every successful check (None: up to date).
-/// Errors keep the old result. Never runs for builds without a known commit. `reconnected` =
-/// check now (after a short settle), on top of the fixed interval. `auto`: install right away
-/// in unit workstation-connect-update; `on_failed` runs after a failed auto-update.
+/// Why the watch loop checks now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    Timer,
+    Reconnected,
+    Requested,
+}
+
+/// Sleeps `wait` (wall clock, see TICK), cut short by a network (re)connect (after a settle
+/// time) or a check request (at once). Requests land in `waiting`.
+async fn wait_next(
+    wait: Duration,
+    reconnected: &Notify,
+    requests: &mut tokio::sync::mpsc::Receiver<CheckRequest>,
+    waiting: &mut Vec<CheckRequest>,
+) -> Wake {
+    let next = SystemTime::now() + wait;
+    // recv() on a closed channel returns None at once: stop polling it then.
+    let mut open = true;
+    while SystemTime::now() < next {
+        tokio::select! {
+            _ = tokio::time::sleep(TICK.min(wait)) => {}
+            r = requests.recv(), if open => match r {
+                Some(tx) => {
+                    waiting.push(tx);
+                    return Wake::Requested;
+                }
+                None => {
+                    debug!("check request channel closed: timer and reconnects only");
+                    open = false;
+                }
+            },
+            _ = reconnected.notified() => {
+                // Connect events come in bursts (primary + connectivity): settle, then drop
+                // the stored permit so the burst gives one check. A request ends the settle.
+                tokio::select! {
+                    _ = tokio::time::sleep(AFTER_RECONNECT) => {}
+                    Some(tx) = requests.recv(), if open => waiting.push(tx),
+                }
+                let _ = tokio::time::timeout(Duration::ZERO, reconnected.notified()).await;
+                return Wake::Reconnected;
+            }
+        }
+    }
+    Wake::Timer
+}
+
+/// Answers every pending check request, including those that came in during the check.
+fn answer(
+    waiting: &mut Vec<CheckRequest>,
+    requests: &mut tokio::sync::mpsc::Receiver<CheckRequest>,
+) {
+    while let Ok(tx) = requests.try_recv() {
+        waiting.push(tx);
+    }
+    if !waiting.is_empty() {
+        debug!(requests = waiting.len(), "answering check requests");
+    }
+    for tx in waiting.drain(..) {
+        // Err: the asking client gave up (menu timeout); nothing to do.
+        if tx.send(()).is_err() {
+            trace!("check requester gone");
+        }
+    }
+}
+
+/// main's sha and whether it's outdated. `checked` caches the last compare API answer.
+async fn check_once(checked: &mut Option<(String, bool)>) -> Result<(String, bool)> {
+    let latest = latest_main().await?;
+    if latest == COMMIT {
+        return Ok((latest, false));
+    }
+    if let Some((sha, out)) = checked.as_ref()
+        && *sha == latest
+    {
+        debug!(latest = %short(&latest), outdated = *out, "main unchanged since the last compare");
+        return Ok((latest, *out));
+    }
+    let l = latest.clone();
+    let out = tokio::task::spawn_blocking(move || compare_blocking(COMMIT, &l))
+        .await
+        .context("compare task")??;
+    *checked = Some((latest.clone(), out));
+    Ok((latest, out))
+}
+
+/// Daemon task: reports the outdated state on every successful check (None: up to date) and
+/// every check's outcome. Errors keep the old outdated state. Never runs for builds without a
+/// known commit. Checks every EVERY, after a network (re)connect (`reconnected`, short settle)
+/// and on request (`requests`, answered once the result is reported). `auto`: install right
+/// away in unit workstation-connect-update; `on_failed` runs after a failed auto-update.
 pub async fn watch(
     auto: bool,
     report: impl Fn(Option<Update>),
+    report_check: impl Fn(Check),
     on_failed: impl Fn(),
     reconnected: &Notify,
+    mut requests: tokio::sync::mpsc::Receiver<CheckRequest>,
 ) {
     if COMMIT == "unknown" {
         info!("update check off: build commit unknown");
         return;
     }
+    let mut waiting = Vec::new();
     if unit_active().await {
         info!("auto-update already running ({UNIT}): waiting for it");
         report(Some(Update {
@@ -336,38 +477,27 @@ pub async fn watch(
         }
         report(None);
     } else {
-        tokio::time::sleep(FIRST_CHECK).await;
+        let wake = wait_next(FIRST_CHECK, reconnected, &mut requests, &mut waiting).await;
+        debug!(?wake, "first update check");
     }
     // Last sha the compare API was asked about, and its answer.
     let mut checked: Option<(String, bool)> = None;
     let mut failed = load_failed();
     loop {
-        debug!("checking for updates");
-        let res = match latest_main().await {
-            Ok(latest) if latest == COMMIT => Ok((latest, false)),
-            Ok(latest) => match &checked {
-                Some((sha, out)) if *sha == latest => {
-                    debug!(latest = %short(&latest), outdated = *out, "main unchanged since the last compare");
-                    Ok((latest, *out))
-                }
-                _ => {
-                    let l = latest.clone();
-                    match tokio::task::spawn_blocking(move || compare_blocking(COMMIT, &l)).await {
-                        Ok(Ok(out)) => {
-                            checked = Some((latest.clone(), out));
-                            Ok((latest, out))
-                        }
-                        Ok(Err(e)) => Err(e),
-                        Err(e) => Err(anyhow::Error::new(e).context("compare task")),
-                    }
-                }
-            },
-            Err(e) => Err(e),
-        };
+        debug!(requests = waiting.len(), "checking for updates");
+        let t = std::time::Instant::now();
+        let res = check_once(&mut checked).await;
+        debug!(
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            ok = res.is_ok(),
+            "update check done"
+        );
+        report_check(Check::new(&res, SystemTime::now()));
         let wait = match res {
             Ok((_, false)) => {
                 debug!("workstation-connect up to date ({VERSION_LONG})");
                 report(None);
+                answer(&mut waiting, &mut requests);
                 EVERY
             }
             Ok((latest, true)) => {
@@ -376,8 +506,9 @@ pub async fn watch(
                     latest: short(&latest),
                     state: UpdateState::Available,
                 };
-                if !auto {
+                let install = if !auto {
                     info!("update available: {} → {}", u.installed, u.latest);
+                    false
                 } else if !may_install(&latest, failed.as_ref(), SystemTime::now()) {
                     info!(
                         "update {} → {}: failed before, retrying after {} min or a newer commit",
@@ -386,10 +517,16 @@ pub async fn watch(
                         FAILED_BACKOFF.as_secs() / 60
                     );
                     u.state = UpdateState::Failed;
+                    false
                 } else {
                     info!("auto-update: {} → {}, installing", u.installed, u.latest);
                     u.state = UpdateState::Updating;
-                    report(Some(u.clone()));
+                    true
+                };
+                report(Some(u.clone()));
+                // Before installing: the install can take minutes, the asker wants the state.
+                answer(&mut waiting, &mut requests);
+                if install {
                     let res = match start_unit().await {
                         Ok(()) => wait_unit().await,
                         Err(e) => Err(e),
@@ -404,9 +541,9 @@ pub async fn watch(
                         failed = Some(f);
                         u.state = UpdateState::Failed;
                         on_failed();
+                        report(Some(u));
                     }
                 }
-                report(Some(u));
                 EVERY
             }
             Err(e) => {
@@ -414,23 +551,16 @@ pub async fn watch(
                     "update check: {e:#}; retrying in {} min",
                     RETRY.as_secs() / 60
                 );
+                answer(&mut waiting, &mut requests);
                 RETRY
             }
         };
         trace!(wait_secs = wait.as_secs(), "next update check");
-        let next = SystemTime::now() + wait;
-        while SystemTime::now() < next {
-            tokio::select! {
-                _ = tokio::time::sleep(TICK.min(wait)) => {}
-                _ = reconnected.notified() => {
-                    // Connect events come in bursts (primary + connectivity): settle, then drop
-                    // the stored permit so the burst gives one check.
-                    tokio::time::sleep(AFTER_RECONNECT).await;
-                    let _ = tokio::time::timeout(Duration::ZERO, reconnected.notified()).await;
-                    debug!("network (re)connected: checking for updates");
-                    break;
-                }
-            }
+        let wake = wait_next(wait, reconnected, &mut requests, &mut waiting).await;
+        match wake {
+            Wake::Timer => trace!("update check: interval"),
+            Wake::Reconnected => debug!("network (re)connected: checking for updates"),
+            Wake::Requested => debug!("update check requested"),
         }
     }
 }
@@ -668,6 +798,46 @@ mod tests {
         assert!(may_install("aaa", None, now));
         assert_eq!(Failed::parse(&f.format()), Some(f));
         assert_eq!(Failed::parse("garbage"), None);
+    }
+
+    #[test]
+    fn check_outcome() {
+        let at = UNIX_EPOCH + Duration::from_secs(42);
+        let sha = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let c = Check::new(&Ok((sha.clone(), false)), at);
+        assert_eq!((c.at, c.outcome), (42, CheckOutcome::UpToDate));
+        assert_eq!(c.latest.as_deref(), Some("0123456"));
+        assert_eq!(
+            Check::new(&Ok((sha, true)), at).outcome,
+            CheckOutcome::Outdated
+        );
+        let c = Check::new(&Err(anyhow::anyhow!("no network")), at);
+        assert_eq!(c.outcome, CheckOutcome::Failed);
+        assert_eq!((c.latest, c.error.as_deref()), (None, Some("no network")));
+        let v = serde_json::to_value(Check::new(&Ok(("a".into(), false)), at)).unwrap();
+        assert_eq!(v["outcome"], "up_to_date");
+    }
+
+    #[tokio::test]
+    async fn request_wakes_and_gets_answered() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let notify = Notify::new();
+        let mut waiting = Vec::new();
+        let (a, a_rx) = tokio::sync::oneshot::channel();
+        tx.send(a).await.unwrap();
+        let wake = wait_next(Duration::from_secs(3600), &notify, &mut rx, &mut waiting).await;
+        assert_eq!(wake, Wake::Requested);
+        // One more arrives during the check: answered too.
+        let (b, b_rx) = tokio::sync::oneshot::channel();
+        tx.send(b).await.unwrap();
+        answer(&mut waiting, &mut rx);
+        assert!(waiting.is_empty());
+        a_rx.await.unwrap();
+        b_rx.await.unwrap();
+        // Closed channel: no busy loop, the timer still ends the wait.
+        drop(tx);
+        let wake = wait_next(Duration::from_millis(20), &notify, &mut rx, &mut waiting).await;
+        assert_eq!(wake, Wake::Timer);
     }
 
     #[test]

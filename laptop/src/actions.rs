@@ -181,24 +181,14 @@ pub async fn menu() -> Result<()> {
         .stdout(Stdio::piped())
         .spawn()
         .with_context(|| format!("start {}", cmd[0]))?;
-    let outdated = crate::ctl::request("status")
-        .await
-        .map_err(|e| debug!("menu: no daemon status, no update item: {e:#}"))
-        .ok()
-        .and_then(|s| {
-            serde_json::from_str::<serde_json::Value>(&s)
-                .map_err(|e| warn!("menu: bad daemon status: {e}"))
-                .ok()
-        })
-        // Not while an auto-update runs (its lock would refuse anyway).
-        .is_some_and(|v| v["update"].is_object() && v["update"]["state"] != "updating");
+    let view = fresh_status().await;
+    let info = info_line(crate::update::VERSION, &view);
     let mut actions = Action::MENU.to_vec();
-    if outdated {
+    if offer_update(&view) {
         actions.push(Action::Update);
     }
-    let input = actions
-        .iter()
-        .map(|a| a.label())
+    let input = std::iter::once(info.as_str())
+        .chain(actions.iter().map(|a| a.label()))
         .collect::<Vec<_>>()
         .join("\n");
     let mut stdin = child.stdin.take().expect("piped");
@@ -206,6 +196,10 @@ pub async fn menu() -> Result<()> {
     drop(stdin);
     let out = child.wait_with_output().await?;
     let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if picked == info.trim() {
+        debug!("menu: info line picked, nothing to do");
+        return Ok(());
+    }
     match actions.into_iter().find(|a| a.label() == picked) {
         Some(a) => run(a, vec![]).await,
         None => {
@@ -213,6 +207,126 @@ pub async fn menu() -> Result<()> {
             Ok(()) // cancelled
         }
     }
+}
+
+/// The menu waits this long for the daemon's update check, then opens without its result.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+const INFO_ICON: &str = "󰋼";
+
+/// Daemon status as the menu sees it when opening.
+#[derive(Debug)]
+enum MenuStatus {
+    NoDaemon,
+    /// The update check took longer than CHECK_TIMEOUT; last known status if the daemon gave one.
+    CheckTimedOut(Option<serde_json::Value>),
+    /// Status right after a fresh update check (or the current one when the daemon couldn't check).
+    Checked(serde_json::Value),
+}
+
+impl MenuStatus {
+    fn status(&self) -> Option<&serde_json::Value> {
+        match self {
+            MenuStatus::NoDaemon | MenuStatus::CheckTimedOut(None) => None,
+            MenuStatus::CheckTimedOut(Some(v)) | MenuStatus::Checked(v) => Some(v),
+        }
+    }
+}
+
+async fn status_request(cmd: &str) -> Result<serde_json::Value> {
+    let answer = crate::ctl::request(cmd).await?;
+    serde_json::from_str(&answer).with_context(|| format!("daemon answer to {cmd}"))
+}
+
+/// Has the daemon check GitHub now (ctl `check`), at most CHECK_TIMEOUT.
+async fn fresh_status() -> MenuStatus {
+    let t = std::time::Instant::now();
+    let view = match tokio::time::timeout(CHECK_TIMEOUT, status_request("check")).await {
+        Ok(Ok(v)) => MenuStatus::Checked(v),
+        Ok(Err(e)) => {
+            // Daemons before `check` close the connection without an answer: plain status.
+            debug!("menu: update check: {e:#}; asking for the plain status");
+            match status_request("status").await {
+                Ok(v) => MenuStatus::Checked(v),
+                Err(e) => {
+                    debug!("menu: no daemon status: {e:#}");
+                    MenuStatus::NoDaemon
+                }
+            }
+        }
+        Err(_) => {
+            warn!(
+                "menu: update check gave no result in {} s, opening with the last known status",
+                CHECK_TIMEOUT.as_secs()
+            );
+            let last = status_request("status")
+                .await
+                .map_err(|e| debug!("menu: no daemon status: {e:#}"))
+                .ok();
+            MenuStatus::CheckTimedOut(last)
+        }
+    };
+    debug!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        view = view_name(&view),
+        "menu: daemon status"
+    );
+    view
+}
+
+fn view_name(v: &MenuStatus) -> &'static str {
+    match v {
+        MenuStatus::NoDaemon => "no daemon",
+        MenuStatus::CheckTimedOut(_) => "check timed out",
+        MenuStatus::Checked(_) => "checked",
+    }
+}
+
+/// Update item in the menu: daemon reports an update, not while an auto-update runs (its lock
+/// would refuse anyway).
+fn offer_update(view: &MenuStatus) -> bool {
+    view.status()
+        .is_some_and(|v| v["update"].is_object() && v["update"]["state"] != "updating")
+}
+
+/// First menu line: installed version and update state. Picking it does nothing.
+fn info_line(installed: &str, view: &MenuStatus) -> String {
+    let mut line = format!("{INFO_ICON}  workstation-connect {installed}");
+    let status = view.status();
+    if let Some(running) = status.and_then(|v| v["version"].as_str())
+        && running != installed
+    {
+        line.push_str(&format!(" (running daemon: {running})"));
+    }
+    let update = status.map(|v| &v["update"]).filter(|u| u.is_object());
+    let latest = |u: &serde_json::Value| u["latest"].as_str().unwrap_or("?").to_string();
+    let outcome = status.and_then(|v| v["update_check"]["outcome"].as_str());
+    let state = match (view, update) {
+        (MenuStatus::NoDaemon, _) => "daemon not running, update state unknown".to_string(),
+        (_, Some(u)) if u["state"] == "updating" => {
+            "newer version on GitHub, updating…".to_string()
+        }
+        (MenuStatus::CheckTimedOut(_), _) => format!(
+            "update check took over {} s, result unknown",
+            CHECK_TIMEOUT.as_secs()
+        ),
+        (_, _) if outcome == Some("failed") => "update check failed".to_string(),
+        (_, Some(u)) if u["state"] == "failed" => {
+            format!(
+                "newer version on GitHub ({}), last update failed",
+                latest(u)
+            )
+        }
+        (_, Some(u)) => format!("newer version on GitHub ({})", latest(u)),
+        (_, None) if outcome == Some("up_to_date") => "up to date".to_string(),
+        (_, None) if status.is_some_and(|v| v["commit"] == "unknown") => {
+            "update check off (build commit unknown)".to_string()
+        }
+        (_, None) => "update state unknown".to_string(),
+    };
+    line.push_str(" · ");
+    line.push_str(&state);
+    line
 }
 
 /// `workstation-connect update` in a terminal: xdg-terminal-exec, else $TERMINAL -e.
@@ -336,6 +450,7 @@ fn parse_mdns_connect(services: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
     #[test]
     fn parses_mdns() {
@@ -354,5 +469,71 @@ mod tests {
         l.sort();
         l.dedup();
         assert_eq!(l.len(), Action::MENU.len() + 1);
+        assert!(
+            l.iter().all(|a| !a.starts_with(INFO_ICON)),
+            "info line looks like an action"
+        );
+    }
+
+    fn checked(update: Value, check: Value) -> MenuStatus {
+        MenuStatus::Checked(
+            json!({"version": "v12", "commit": "0123456789012345678901234567890123456789",
+            "update": update, "update_check": check}),
+        )
+    }
+
+    #[test]
+    fn info_line_states() {
+        let info = |v: &MenuStatus| info_line("v12", v);
+        let ok = json!({"at": 1, "outcome": "up_to_date", "latest": "abc1234", "error": null});
+        let out = json!({"at": 1, "outcome": "outdated", "latest": "def5678", "error": null});
+        let bad =
+            json!({"at": 1, "outcome": "failed", "latest": null, "error": "git ls-remote: …"});
+        let upd = |state: &str| json!({"installed": "v12", "latest": "def5678", "state": state});
+
+        assert_eq!(
+            info(&checked(Value::Null, ok.clone())),
+            "󰋼  workstation-connect v12 · up to date"
+        );
+        assert_eq!(
+            info(&checked(upd("available"), out.clone())),
+            "󰋼  workstation-connect v12 · newer version on GitHub (def5678)"
+        );
+        assert!(
+            info(&checked(upd("updating"), out.clone()))
+                .ends_with("· newer version on GitHub, updating…")
+        );
+        assert!(info(&checked(upd("failed"), out)).ends_with("(def5678), last update failed"));
+        assert!(info(&checked(Value::Null, bad.clone())).ends_with("· update check failed"));
+        // Failed check with an older outdated result: the failure wins, update item stays.
+        assert!(info(&checked(upd("available"), bad.clone())).ends_with("· update check failed"));
+        assert!(offer_update(&checked(upd("available"), bad)));
+        // Daemon before update_check, or no check yet.
+        assert!(info(&checked(Value::Null, Value::Null)).ends_with("· update state unknown"));
+        assert!(
+            info(&MenuStatus::NoDaemon).ends_with("· daemon not running, update state unknown")
+        );
+        assert!(info(&MenuStatus::CheckTimedOut(None)).ends_with("took over 3 s, result unknown"));
+        let unknown =
+            MenuStatus::Checked(json!({"version": "unknown", "commit": "unknown", "update": null}));
+        assert_eq!(
+            info_line("unknown", &unknown),
+            "󰋼  workstation-connect unknown · update check off (build commit unknown)"
+        );
+        let old_daemon =
+            MenuStatus::Checked(json!({"version": "v11", "update": null, "update_check": ok}));
+        assert!(info(&old_daemon).contains("v12 (running daemon: v11) · up to date"));
+    }
+
+    #[test]
+    fn update_item_only_when_installable() {
+        let upd = |state: &str| json!({"installed": "v12", "latest": "def5678", "state": state});
+        assert!(offer_update(&checked(upd("available"), Value::Null)));
+        assert!(offer_update(&checked(upd("failed"), Value::Null)));
+        assert!(!offer_update(&checked(upd("updating"), Value::Null)));
+        assert!(!offer_update(&checked(Value::Null, Value::Null)));
+        assert!(!offer_update(&MenuStatus::NoDaemon));
+        let last = json!({"update": upd("available")});
+        assert!(offer_update(&MenuStatus::CheckTimedOut(Some(last))));
     }
 }

@@ -94,8 +94,8 @@ journalctl --user -fu workstation-connect
 ```
 Phone battery/signal come from the Bluetooth link when in reach, else from KDE Connect.
 CSS classes: `idle`, `nophone`, `offline`, `activating` (also during a selftest), `tethered`, `paused`, `down`.
-Outdated install (GitHub main has newer `laptop/` commits): daemon checks every 5 min and on every
-network reconnect, via `git ls-remote` (no API quota); the GitHub compare API only for a main sha it
+Outdated install (GitHub main has newer `laptop/` commits): daemon checks every 5 min, on every
+network reconnect and when the menu opens, via `git ls-remote` (no API quota); the GitHub compare API only for a main sha it
 hasn't seen yet (60 requests/h per IP). Text gets `󰚰`, tooltip shows `installed → latest`, class
 becomes `["<class>", "outdated"]`.
 - `auto_update = true` (default): installs at once, no click: `workstation-connect update` in the transient
@@ -151,14 +151,22 @@ timings (exit code 1 on any FAIL):
   the bucket.
 
 Daemon socket `$XDG_RUNTIME_DIR/workstation-connect.sock`, one request line, one JSON answer line:
-`status | pause | resume | toggle`, `watch` (status line on every change), or JSON
+`status | pause | resume | toggle`, `check` (update check now, answers with the status once it's
+done; at once while an auto-update runs), `watch` (status line on every change), or JSON
 `{"cmd": "selftest_link"}`, `{"cmd": "selftest_hotspot"}` (→ `{"steps": [{name, res, ms, detail}]}`),
 `{"cmd": "upload", "reason": "<reason>", "report": "…"}` (→ `{"key": …}`, null when upload off);
-errors `{"error": "…"}`. Status has `version` (the running daemon's, `v<n>`) and `commit` (its full build commit).
+errors `{"error": "…"}`. Status has `version` (the running daemon's, `v<n>`) and `commit` (its full build commit),
+`update` (only when outdated: `installed`, `latest`, `state` = `available | updating | failed`) and
+`update_check` (last finished check: `at` unix seconds, `outcome` = `up_to_date | outdated | failed`,
+`latest` short commit, `error`; null before the first check or with an unknown build commit).
 
 CLI: `workstation-connect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update | logs-key | selftest`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
 - `menu`: walker/fuzzel/wofi/rofi (dmenu mode), first found; override with `menu = [...]` in config.
+  First line: installed version + update state from a fresh check (socket `check`, waits at most
+  3 s, usually under 1 s: `git ls-remote`, compare API only for a new main commit), e.g.
+  `workstation-connect v12 · up to date` / `· newer version on GitHub (abc1234)` / `· update check failed`
+  / `· daemon not running, update state unknown`. Picking it does nothing.
 - `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,
   else finds the phone via mDNS (same network). First time: `adb pair <ip:port> <code>`.
 - `browse`: mounts the phone over sftp (kdeconnectd) and opens it with xdg-open.

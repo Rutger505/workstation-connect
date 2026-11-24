@@ -53,6 +53,8 @@ pub struct Status {
     pub error: Option<String>,
     /// Only when the installed workstation-connect is behind GitHub main.
     pub update: Option<crate::update::Update>,
+    /// Last finished update check (None: none yet, or the build commit is unknown).
+    pub update_check: Option<crate::update::Check>,
 }
 
 struct Ctx {
@@ -68,6 +70,8 @@ struct Ctx {
     /// Bumped on every resume from suspend: offline timer and cooldown start over.
     resumes: watch::Sender<u64>,
     uploader: Uploader,
+    /// To the update watch loop: check now (ctl `check`).
+    check_now: tokio::sync::mpsc::Sender<crate::update::CheckRequest>,
 }
 
 impl Ctx {
@@ -177,7 +181,9 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
         offline_secs: None,
         error: None,
         update: None,
+        update_check: None,
     });
+    let (check_now, check_requests) = tokio::sync::mpsc::channel(16);
     let ctx = Arc::new(Ctx {
         cfg,
         nm: Nm::new().await?,
@@ -188,6 +194,7 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
         epoch: AtomicU64::new(0),
         resumes: watch::channel(0).0,
         uploader: Uploader::spawn(),
+        check_now,
     });
     info!(
         "workstation-connect {} started",
@@ -219,8 +226,10 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
             crate::update::watch(
                 auto,
                 |u| c.set(|s| s.update = u),
+                |check| c.set(|s| s.update_check = Some(check)),
                 || up.trigger(Reason::Update),
                 &r,
+                check_requests,
             )
             .await
         }
@@ -894,6 +903,7 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
     }
     match line.trim() {
         "status" => {}
+        "check" => check_now(&ctx).await,
         "pause" => pause(true),
         "resume" => pause(false),
         "toggle" => {
@@ -917,6 +927,37 @@ async fn client(ctx: Arc<Ctx>, stream: UnixStream) -> Result<()> {
     let s = serde_json::to_string(&*ctx.status.borrow())?;
     w.write_all(format!("{s}\n").as_bytes()).await?;
     Ok(())
+}
+
+/// ctl `check`: has the update watch loop check GitHub now and waits for the result (the menu
+/// shows it). Returns at once when that can't happen: auto-update running, loop gone (build
+/// commit unknown) or many requests queued.
+async fn check_now(ctx: &Ctx) {
+    // copy first: never hold a borrow() guard across an await
+    let updating = ctx
+        .status
+        .borrow()
+        .update
+        .as_ref()
+        .is_some_and(|u| u.state == crate::update::UpdateState::Updating);
+    if updating {
+        debug!("check: auto-update running, answering with the current status");
+        return;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Err(e) = ctx.check_now.try_send(tx) {
+        debug!(
+            "check: update watch loop not taking requests ({e}), answering with the current status"
+        );
+        return;
+    }
+    let t = Instant::now();
+    // git ls-remote (30 s) + compare API (15 s) have their own timeouts; this only bounds a stuck loop.
+    match tokio::time::timeout(Duration::from_secs(60), rx).await {
+        Ok(Ok(())) => debug!(elapsed_ms = t.elapsed().as_millis() as u64, "check: done"),
+        Ok(Err(_)) => warn!("check: update watch loop dropped the request"),
+        Err(_) => warn!("check: no result after 60 s, answering with the current status"),
+    }
 }
 
 /// JSON requests on the ctl socket (one line, `{"cmd": …}`); answer: one JSON line, `{"error": …}`
