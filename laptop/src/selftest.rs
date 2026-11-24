@@ -268,6 +268,23 @@ async fn section_kde(want: Option<&str>) -> Vec<Step> {
         )),
         Err(e) => steps.push(Step::fail("kdeconnectd answers", Some(t), format!("{e:#}"))),
     }
+    steps.push(
+        match std::fs::read_to_string(crate::kde::logging_dropin_path()) {
+            Ok(s) if s == crate::kde::logging_dropin() => {
+                Step::pass("kdeconnectd logging", None, crate::kde::QT_LOGGING_RULES)
+            }
+            Ok(_) => Step::fail(
+                "kdeconnectd logging",
+                None,
+                "drop-in outdated: workstation-connect setup",
+            ),
+            Err(_) => Step::fail(
+                "kdeconnectd logging",
+                None,
+                "drop-in missing (kdeconnectd logs almost nothing): workstation-connect setup",
+            ),
+        },
+    );
     let t = Instant::now();
     match kde.paired().await {
         Ok(ids) => steps.push(Step::pass(

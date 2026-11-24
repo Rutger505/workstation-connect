@@ -20,6 +20,15 @@ pub const UNIT: &str = "app-org.kde.kdeconnect.daemon@autostart.service";
 /// systemctl calls (restart of a hung kdeconnectd: SIGTERM ends it, its main thread isn't needed).
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Qt logging rules for kdeconnectd: `kdeconnect.core` debug = discovery, link up/down, pairing,
+/// plugin loading (checked against kdeconnect-kde core/: no packet bodies, those lines are
+/// commented out upstream). Plugin categories (`kdeconnect.plugin.*`) stay off: clipboard and
+/// notification content.
+pub const QT_LOGGING_RULES: &str = "kdeconnect.core.debug=true";
+/// Drop-in for the template, so it applies to the generated `@autostart` instance.
+const DROPIN_DIR: &str = "systemd/user/app-org.kde.kdeconnect.daemon@.service.d";
+const DROPIN_FILE: &str = "workstation-connect-logging.conf";
+
 /// kdeconnectd's state as seen by a probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
@@ -511,6 +520,45 @@ pub async fn restart() -> Result<()> {
         "kde connect: kdeconnectd restarted"
     );
     Ok(())
+}
+
+pub fn logging_dropin_path() -> std::path::PathBuf {
+    crate::config::xdg_config()
+        .join(DROPIN_DIR)
+        .join(DROPIN_FILE)
+}
+
+pub fn logging_dropin() -> String {
+    format!(
+        "# Written by `workstation-connect setup`: kdeconnectd connection/pairing lifecycle in the\n\
+         # journal (uploaded with the laptop logs). kdeconnect.core only: no packet or plugin content.\n\
+         [Service]\n\
+         Environment=QT_LOGGING_RULES={QT_LOGGING_RULES}\n"
+    )
+}
+
+/// Writes the kdeconnectd logging drop-in and reloads systemd if it changed. Returns whether it
+/// changed (kdeconnectd picks it up on its next start).
+pub async fn ensure_logging_dropin() -> Result<bool> {
+    let path = logging_dropin_path();
+    let want = logging_dropin();
+    match std::fs::read_to_string(&path) {
+        Ok(have) if have == want => {
+            debug!(path = %path.display(), "kde connect: logging drop-in up to date");
+            return Ok(false);
+        }
+        Ok(_) => debug!(path = %path.display(), "kde connect: logging drop-in outdated"),
+        Err(e) => debug!(path = %path.display(), "kde connect: logging drop-in: {e}"),
+    }
+    let dir = path.parent().expect("has a parent");
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::write(&path, want).with_context(|| format!("write {}", path.display()))?;
+    info!(path = %path.display(), "kde connect: logging drop-in written");
+    let (ok, out) = systemctl(&["daemon-reload"]).await?;
+    if !ok {
+        bail!("systemctl --user daemon-reload: {out}");
+    }
+    Ok(true)
 }
 
 /// Pause = KDE Connect fully off too: disables every enabled link provider and remembers which

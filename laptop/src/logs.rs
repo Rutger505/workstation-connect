@@ -269,7 +269,9 @@ async fn run(cmd: &mut Command) -> Result<(bool, String, String)> {
     ))
 }
 
-/// User journal of workstation-connect, the update unit and kdeconnectd after `cursor`.
+/// User journal of workstation-connect, the update unit and kdeconnectd after `cursor`. No
+/// priority filter on purpose: kdeconnectd's lifecycle lines (QT_LOGGING_RULES drop-in from
+/// `setup`) are Qt debug messages, journal priority 7.
 async fn user_journal(cursor: Option<&str>) -> Result<(String, Option<String>)> {
     let mut cmd = Command::new("journalctl");
     cmd.args([

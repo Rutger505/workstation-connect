@@ -681,6 +681,12 @@ async fn kde_watch(ctx: Arc<Ctx>) {
 async fn kde_watchdog(ctx: Arc<Ctx>) {
     use crate::kde::{Health, Kde};
     use logic::{KdeProbe, KdeVerdict, KdeWatchdog};
+    match std::fs::metadata(crate::kde::logging_dropin_path()) {
+        Ok(_) => debug!("kdeconnectd logging drop-in present"),
+        Err(_) => info!(
+            "kdeconnectd logs little: run `workstation-connect setup` once for its connection/pairing log"
+        ),
+    }
     let mut wd = KdeWatchdog::default();
     let mut kde: Option<Kde> = None;
     let mut last_err: Option<String> = None;

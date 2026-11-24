@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::kde::{Kde, file_url};
 use anyhow::{Context, Result, bail};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
@@ -104,6 +105,7 @@ pub async fn setup() -> Result<()> {
         .map_err(|e| warn!("{e:#}: setting up without config (share_dir not applied)"))
         .ok();
     let kde = Kde::connect().await?;
+    kde_logging(&kde).await?;
     let id = phone(&kde).await?;
     let p = kde.phone(&id).await?;
     println!("phone: {} ({id})", p.name);
@@ -149,6 +151,49 @@ pub async fn setup() -> Result<()> {
             "files/photos from phone → kdeconnect default (~/Downloads); set share_dir in config.toml to change"
         );
     }
+    Ok(())
+}
+
+/// kdeconnectd lifecycle logging (systemd drop-in with QT_LOGGING_RULES). Changed + kdeconnectd
+/// running in its unit: restarts it so it applies now, then waits until it answers again.
+async fn kde_logging(kde: &Kde) -> Result<()> {
+    let path = crate::kde::logging_dropin_path();
+    if !crate::kde::ensure_logging_dropin().await? {
+        println!("kdeconnectd logging: on ({})", path.display());
+        return Ok(());
+    }
+    println!("kdeconnectd logging: drop-in written ({})", path.display());
+    match crate::kde::unit_active().await {
+        Ok(true) => {}
+        Ok(false) => {
+            println!(
+                "kdeconnectd logging: applies when {} starts next",
+                crate::kde::UNIT
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            warn!("{e:#}: not restarting kdeconnectd");
+            println!("kdeconnectd logging: applies when kdeconnectd restarts next");
+            return Ok(());
+        }
+    }
+    crate::kde::restart().await?;
+    let t = std::time::Instant::now();
+    loop {
+        match kde.health().await {
+            Ok(crate::kde::Health::Ok) => break,
+            r if t.elapsed() > Duration::from_secs(15) => {
+                bail!("kdeconnectd not answering 15 s after its restart: {r:?}")
+            }
+            r => debug!("setup: waiting for kdeconnectd: {r:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    println!(
+        "kdeconnectd logging: on, kdeconnectd restarted ({} ms)",
+        t.elapsed().as_millis()
+    );
     Ok(())
 }
 
