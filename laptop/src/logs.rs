@@ -376,7 +376,7 @@ async fn build(reasons: &[Reason], extra: Option<&str>, now: u64) -> Result<Payl
     let mut head = format!(
         "host: {}\nworkstation-connect: {}\nkernel: {}\nreason: {}\ntime: {}\njournal since: {}\n",
         hostname(),
-        crate::update::VERSION,
+        crate::update::VERSION_LONG,
         kernel(),
         names.join(", "),
         iso(now),
@@ -432,7 +432,7 @@ fn put_blocking(creds: &Credentials, key: &str, body: String) -> Result<()> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(PUT_TIMEOUT))
         .http_status_as_error(false)
-        .user_agent(concat!("workstation-connect/", env!("CARGO_PKG_VERSION")))
+        .user_agent(crate::update::USER_AGENT)
         .build()
         .into();
     let mut res = agent

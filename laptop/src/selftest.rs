@@ -5,7 +5,7 @@
 use crate::config::Config;
 use crate::kde::{KEY_PLUGINS, Kde};
 use crate::logs::{self, Reason};
-use crate::update::VERSION;
+use crate::update::{COMMIT, VERSION, VERSION_LONG};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -141,7 +141,7 @@ async fn section_basics(
     cfg_err: &str,
     status: &mut Option<Value>,
 ) -> Vec<Step> {
-    let mut steps = vec![Step::pass("workstation-connect", None, VERSION)];
+    let mut steps = vec![Step::pass("workstation-connect", None, VERSION_LONG)];
     let t = Instant::now();
     match crate::ctl::request("status")
         .await
@@ -156,11 +156,16 @@ async fn section_basics(
                 Some(t),
                 format!("daemon {dv}, mode {}", v["mode"].as_str().unwrap_or("?")),
             ));
-            if dv != VERSION {
+            // Same v<n> can still be another build (local commits): compare commits when known.
+            let stale = match v["commit"].as_str() {
+                Some(dc) => dc != COMMIT,
+                None => dv != VERSION,
+            };
+            if stale {
                 steps.push(Step::fail(
                     "daemon version",
                     None,
-                    format!("daemon runs {dv}, installed is {VERSION}: systemctl --user restart workstation-connect"),
+                    format!("daemon runs {dv}, installed is {VERSION_LONG}: systemctl --user restart workstation-connect"),
                 ));
             }
             match v["update"]["state"].as_str() {
@@ -449,7 +454,7 @@ pub async fn run(no_hotspot: bool, no_send: bool) -> Result<()> {
     let report = render(
         &format!(
             "workstation-connect selftest on {host}, {} ({})",
-            VERSION,
+            VERSION_LONG,
             logs::amz_date(secs)
         ),
         &sections,

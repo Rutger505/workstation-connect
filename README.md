@@ -154,7 +154,7 @@ Daemon socket `$XDG_RUNTIME_DIR/workstation-connect.sock`, one request line, one
 `status | pause | resume | toggle`, `watch` (status line on every change), or JSON
 `{"cmd": "selftest_link"}`, `{"cmd": "selftest_hotspot"}` (→ `{"steps": [{name, res, ms, detail}]}`),
 `{"cmd": "upload", "reason": "<reason>", "report": "…"}` (→ `{"key": …}`, null when upload off);
-errors `{"error": "…"}`. Status has `version` (the running daemon's).
+errors `{"error": "…"}`. Status has `version` (the running daemon's, `v<n>`) and `commit` (its full build commit).
 
 CLI: `workstation-connect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update | logs-key | selftest`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
@@ -162,9 +162,12 @@ CLI: `workstation-connect status | pause | resume | toggle | menu | clip | send 
 - `screen`: scrcpy over wireless debugging (on anyway for Shizuku). Uses an existing adb connection,
   else finds the phone via mDNS (same network). First time: `adb pair <ip:port> <code>`.
 - `browse`: mounts the phone over sftp (kdeconnectd) and opens it with xdg-open.
-- `update`: clones/fetches main into `~/.cache/workstation-connect/src`, `cargo install --path … --force --locked --target-dir ~/.cache/workstation-connect/target` (kept build cache: only changed crates recompile), checks the installed `--version` matches the fetched commit, then restarts the daemon if active. One at a time (lock `~/.cache/workstation-connect/update.lock`). Menu runs it
-  via `xdg-terminal-exec`, else `$TERMINAL -e`. `--version` shows the build commit (`unknown`
-  without git: no update check).
+- `update`: clones/fetches main into `~/.cache/workstation-connect/src`, `cargo install --path … --force --locked --target-dir ~/.cache/workstation-connect/target` (kept build cache: only changed crates recompile), checks the installed `--build-commit` (hidden flag) matches the fetched commit, then restarts the daemon if active. One at a time (lock `~/.cache/workstation-connect/update.lock`). Menu runs it
+  via `xdg-terminal-exec`, else `$TERMINAL -e`. `--version` shows `v<n>`: first-parent commits
+  touching `laptop/` since the base in `laptop/build.rs` (v1 = first one after it). Without git
+  history (shallow clone): `unknown`, and an unknown commit means no update check. Selftest and
+  log uploads add the short commit: `v3 (abc1234)`. Updaters before v1 need the commit in
+  `--version` (TRANSITIONAL: printed when the parent is `workstation-connect update`).
 - Rename `wsconnect` → `workstation-connect` (TRANSITIONAL): the package also installs a `wsconnect`
   shim (`laptop/src/bin/wsconnect.rs`) that execs `workstation-connect`, so old updaters and
   `wsconnect.service` still work. At daemon start `laptop/src/migrate.rs` moves

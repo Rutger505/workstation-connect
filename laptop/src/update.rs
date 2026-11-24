@@ -15,13 +15,31 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
 pub const COMMIT: &str = env!("WSCONNECT_COMMIT");
-pub const COMMIT_SHORT: &str = env!("WSCONNECT_COMMIT_SHORT");
-pub const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
+/// User-facing version "v<n>" (see build.rs), "unknown" without git history.
+pub const VERSION: &str = env!("WSCONNECT_VERSION");
+/// For diagnostics (selftest, log uploads): "v<n> (<short commit>)".
+pub const VERSION_LONG: &str = concat!(
+    env!("WSCONNECT_VERSION"),
     " (",
     env!("WSCONNECT_COMMIT_SHORT"),
     ")"
 );
+pub const USER_AGENT: &str = concat!("workstation-connect/", env!("WSCONNECT_VERSION"));
+
+/// TRANSITIONAL (Nov 2026, versioning): updaters before v1 run this binary's `--version` right
+/// after installing it and require "(<short commit>)" in it, else the update fails and the daemon
+/// isn't restarted. So `--version` keeps the commit when the parent is `workstation-connect update`
+/// (or the pre-rename `wsconnect update`). Remove once every laptop runs >= v1.
+pub fn called_by_updater() -> bool {
+    let ppid = std::os::unix::process::parent_id();
+    let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline")) else {
+        return false;
+    };
+    let mut args = cmdline.split(|&b| b == 0);
+    let exe = args.next().unwrap_or_default();
+    let name = exe.rsplit(|&b| b == b'/').next().unwrap_or_default();
+    matches!(name, b"workstation-connect" | b"wsconnect") && args.next() == Some(b"update")
+}
 
 const REPO: &str = "Rutger505/workstation-connect";
 const GIT_URL: &str = "https://github.com/Rutger505/workstation-connect";
@@ -127,7 +145,7 @@ fn compare_blocking(installed: &str, latest: &str) -> Result<bool> {
     debug!(installed, latest, "GitHub compare API");
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
-        .user_agent(concat!("workstation-connect/", env!("CARGO_PKG_VERSION")))
+        .user_agent(USER_AGENT)
         .build()
         .into();
     let compare: Value = serde_json::from_str(&get(
@@ -308,7 +326,7 @@ pub async fn watch(
     if unit_active().await {
         info!("auto-update already running ({UNIT}): waiting for it");
         report(Some(Update {
-            installed: COMMIT_SHORT.into(),
+            installed: VERSION.into(),
             latest: "?".into(),
             state: UpdateState::Updating,
         }));
@@ -348,13 +366,13 @@ pub async fn watch(
         };
         let wait = match res {
             Ok((_, false)) => {
-                debug!("workstation-connect up to date ({COMMIT_SHORT})");
+                debug!("workstation-connect up to date ({VERSION_LONG})");
                 report(None);
                 EVERY
             }
             Ok((latest, true)) => {
                 let mut u = Update {
-                    installed: COMMIT_SHORT.into(),
+                    installed: VERSION.into(),
                     latest: short(&latest),
                     state: UpdateState::Available,
                 };
@@ -539,7 +557,6 @@ async fn install() -> Result<()> {
         .await?;
     }
     let head = git_out(&src, &["rev-parse", "HEAD"]).await?;
-    let head = head.get(..7).unwrap_or(&head).to_string();
     run_ok(
         Command::new("cargo")
             .args(["install", "--force", "--locked", "--path"])
@@ -550,18 +567,26 @@ async fn install() -> Result<()> {
     )
     .await?;
     // Guard against a stale build ever again: the installed binary must report the fetched commit.
-    let out = Command::new("workstation-connect")
+    // Runs the binary just installed (always has --build-commit), never the one running this.
+    let commit = Command::new("workstation-connect")
+        .arg("--build-commit")
+        .output()
+        .await
+        .context("run workstation-connect")?;
+    let commit = String::from_utf8_lossy(&commit.stdout).trim().to_string();
+    if commit != head {
+        bail!(
+            "installed build `{commit}`, expected commit {head} (PATH has another workstation-connect, or stale build: delete {})",
+            cache.display()
+        );
+    }
+    // Prints "… v<n> (<short>)": we're the parent (see called_by_updater).
+    let version = Command::new("workstation-connect")
         .arg("--version")
         .output()
         .await
         .context("run workstation-connect")?;
-    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !version.contains(&format!("({head})")) {
-        bail!(
-            "installed `{version}`, expected commit {head} (PATH has another workstation-connect, or stale build: delete {})",
-            cache.display()
-        );
-    }
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
     println!("installed {version}");
     // TRANSITIONAL: "wsconnect" = pre-rename unit, in case its migration hasn't happened
     // (remove with src/bin/wsconnect.rs).
@@ -647,7 +672,9 @@ mod tests {
 
     #[test]
     fn version_has_commit() {
-        assert!(VERSION.ends_with(&format!("({COMMIT_SHORT})")));
+        assert!(VERSION == "unknown" || VERSION.starts_with('v'));
+        let short = COMMIT.get(..7).unwrap_or(COMMIT);
+        assert_eq!(VERSION_LONG, format!("{VERSION} ({short})"));
         assert!(COMMIT == "unknown" || COMMIT.len() == 40);
     }
 }

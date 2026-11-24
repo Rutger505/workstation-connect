@@ -17,15 +17,18 @@ mod sigv4;
 mod update;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use tracing::{debug, error, warn};
 
 /// Laptop side of workstation-connect: phone internet on demand over Bluetooth.
 #[derive(Parser)]
 #[command(version = update::VERSION)]
 struct Cli {
+    /// Print the full build commit (updater's stale-build guard).
+    #[arg(long, hide = true, exclusive = true)]
+    build_commit: bool,
     #[command(subcommand)]
-    cmd: Command,
+    cmd: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -98,8 +101,26 @@ impl Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // TRANSITIONAL: see update::called_by_updater.
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if matches!(&args[..], [a] if a == "--version" || a == "-V") && update::called_by_updater() {
+        println!("workstation-connect {}", update::VERSION_LONG);
+        return Ok(());
+    }
     let cli = Cli::parse();
-    if let Command::Daemon = cli.cmd {
+    if cli.build_commit {
+        println!("{}", update::COMMIT);
+        return Ok(());
+    }
+    let Some(cmd) = cli.cmd else {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingSubcommand,
+                "a subcommand is required",
+            )
+            .exit()
+    };
+    if let Command::Daemon = cmd {
         // Config first: it may set the log level. Its error is logged right after.
         let cfg = config::Config::load();
         let filter = logging::init(
@@ -122,8 +143,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     logging::init(logging::Kind::Cli, None);
-    debug!(cmd = cli.cmd.name(), version = update::VERSION, "cli");
-    match cli.cmd {
+    debug!(cmd = cmd.name(), version = update::VERSION, "cli");
+    match cmd {
         Command::Daemon => unreachable!("handled above"),
         Command::Waybar => ctl::waybar().await,
         Command::Menu => actions::menu().await,

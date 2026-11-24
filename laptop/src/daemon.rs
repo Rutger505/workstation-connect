@@ -44,6 +44,8 @@ pub enum Mode {
 pub struct Status {
     /// Running daemon's version (may differ from the installed CLI until restarted).
     pub version: &'static str,
+    /// Running daemon's full build commit ("unknown" without git).
+    pub commit: &'static str,
     pub mode: Mode,
     pub paused: bool,
     pub phone: Link,
@@ -168,6 +170,7 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
     let phone = Phone::spawn(addr);
     let (status, _) = watch::channel(Status {
         version: crate::update::VERSION,
+        commit: crate::update::COMMIT,
         mode: Mode::Idle,
         paused: false,
         phone: Link::default(),
@@ -186,7 +189,10 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
         resumes: watch::channel(0).0,
         uploader: Uploader::spawn(),
     });
-    info!("workstation-connect {} started", crate::update::VERSION);
+    info!(
+        "workstation-connect {} started",
+        crate::update::VERSION_LONG
+    );
     debug!(socket = %socket_path().display(), "tasks starting");
     ctx.uploader.trigger(Reason::Start);
 

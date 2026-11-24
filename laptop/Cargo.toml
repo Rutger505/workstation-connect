@@ -1,6 +1,6 @@
 [package]
 name = "workstation-connect"
-version = "0.1.0"
+version = "0.1.0" # unused: the shown version is v<n> from build.rs
 edition = "2024"
 default-run = "workstation-connect"
 description = "Laptop side of workstation-connect: phone hotspot on demand over Bluetooth"
