@@ -128,7 +128,7 @@ restart. No file: upload off (one info line).
   `~/.local/state/workstation-connect/upload.cursor`; first time: last hour), plus best effort the system
   journal of `bluetooth.service` and Bluetooth kernel lines (needs journal read access). Newest
   ~1 MB.
-- Reasons: `kde-restart` (watchdog restarted or failed to restart kdeconnectd, below), `start` (daemon start, so also after an update), `link-ok` / `link-fail` (phone link
+- Reasons: `kde-restart` (kdeconnectd restarted or restart failed: watchdog or Bluetooth adapter back, below), `start` (daemon start, so also after an update), `link-ok` / `link-fail` (phone link
   connected / 3 connects failed in a row outside the 20 s after resume), `hotspot-ok` /
   `hotspot-fail` (hotspot join outcome), `update` (auto-update failed), `periodic` (every 10 min
   while online, only with new lines), `selftest`. Triggers within 5 s become one upload.
@@ -149,6 +149,14 @@ logs its threads' kernel wait channels, `systemctl --user restart app-org.kde.kd
 log upload; at most one restart per 10 min (skip logged once). Running outside that unit: no
 restart, error in the status. Status `kde_health`: `state` = `unknown | ok | not_running | hung`,
 `last_restart` (unix s), `restart_error`.
+
+**Bluetooth adapter back**: kdeconnectd's Bluetooth backend looks for an adapter only at start
+and resume, never again (`No local bluetooth adapter found`). On this laptop btusb is unloaded on
+every suspend (`/usr/lib/systemd/system-sleep/btusb-workaround`, MT7921) and hci0 needs ~2.5 s
+after resume, so kdeconnectd lost Bluetooth after every suspend. The daemon watches bluez (adapter
+removed/added, Powered) and when the adapter comes back after a gap: 3 s settle, then restarts the
+kdeconnectd unit (same status fields + `kde-restart` upload). Skipped when its unit isn't active
+or its `bluetooth` link provider is off (pause); at most one per 30 s.
 
 **Selftest**: `workstation-connect selftest [--no-hotspot] [--no-send]` prints PASS/FAIL/SKIP per step with
 timings (exit code 1 on any FAIL):

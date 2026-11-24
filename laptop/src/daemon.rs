@@ -270,6 +270,7 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
     tokio::spawn(periodic_upload(ctx.clone()));
     tokio::spawn(kde_watch(ctx.clone()));
     tokio::spawn(kde_watchdog(ctx.clone()).instrument(info_span!("kde_watchdog")));
+    tokio::spawn(bt_adapter_watch(ctx.clone()).instrument(info_span!("bt_adapter")));
     tokio::spawn(reconnect_watch(ctx.clone(), reconnected));
     tokio::spawn(sleep_guard(ctx.clone()));
     tokio::spawn(wifi_guard(ctx.clone()));
@@ -800,6 +801,177 @@ async fn restart_kdeconnectd(ctx: &Ctx, kde: Option<&crate::kde::Kde>) {
         Ok(()) => None,
         Err(e) => {
             error!("kdeconnectd restart failed: {e:#}");
+            Some(format!("{e:#}"))
+        }
+    };
+    ctx.set(|s| {
+        s.kde_health.last_restart = Some(now);
+        s.kde_health.restart_error = restart_error;
+    });
+    ctx.uploader.trigger(Reason::KdeRestart);
+}
+
+/// Restarts kdeconnectd when the Bluetooth adapter comes back after a gap (see
+/// [`logic::BtAdapterWatch`]): without it the phone stays off Bluetooth in KDE Connect (trackpad,
+/// notifications) until kdeconnectd's next start. Event-driven; a slow poll catches missed events.
+async fn bt_adapter_watch(ctx: Arc<Ctx>) {
+    let mut watch = logic::BtAdapterWatch::default();
+    let mut last_restart: Option<Instant> = None;
+    loop {
+        let res: Result<()> = bt_adapter_session(&ctx, &mut watch, &mut last_restart).await;
+        if let Err(e) = res {
+            warn!("bluetooth adapter watch: {e:#}, retrying in 10 s");
+        }
+        sleep(Duration::from_secs(10)).await;
+    }
+}
+
+/// Adapter usable right now (present + powered), with its name.
+async fn bt_adapter_state(session: &bluer::Session) -> (bool, Option<String>) {
+    let call = Duration::from_secs(10);
+    let adapter = match tokio::time::timeout(call, session.default_adapter()).await {
+        Ok(Ok(a)) => a,
+        Ok(Err(e)) => {
+            debug!("bluetooth adapter watch: no adapter ({e})");
+            return (false, None);
+        }
+        Err(_) => {
+            debug!("bluetooth adapter watch: bluetoothd not answering");
+            return (false, None);
+        }
+    };
+    let name = adapter.name().to_string();
+    let powered = matches!(
+        tokio::time::timeout(call, adapter.is_powered()).await,
+        Ok(Ok(true))
+    );
+    (powered, Some(name))
+}
+
+async fn bt_adapter_session(
+    ctx: &Ctx,
+    watch: &mut logic::BtAdapterWatch,
+    last_restart: &mut Option<Instant>,
+) -> Result<()> {
+    use bluer::{AdapterEvent, AdapterProperty, SessionEvent};
+    let session = bluer::Session::new().await.context("bluez session")?;
+    let session_events = session.events().await.context("bluez adapter events")?;
+    pin_mut!(session_events);
+    loop {
+        // Subscribe before reading the state: nothing slips in between.
+        let (usable, name) = bt_adapter_state(&session).await;
+        let adapter_events = match &name {
+            Some(n) => Some(session.adapter(n)?.events().await?),
+            None => None,
+        };
+        if watch.observe(usable) {
+            info!(adapter = ?name, "bluetooth adapter back");
+            restart_kdeconnectd_for_bt(ctx, &session, watch, last_restart).await;
+        }
+        let adapter_events = async {
+            match adapter_events {
+                Some(s) => {
+                    pin_mut!(s);
+                    while let Some(ev) = s.next().await {
+                        if let AdapterEvent::PropertyChanged(AdapterProperty::Powered(on)) = ev {
+                            return Some(on);
+                        }
+                    }
+                    None
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            ev = session_events.next() => match ev {
+                // Seen gone, even if it's back by the time we re-read the state.
+                Some(SessionEvent::AdapterRemoved(n)) => {
+                    debug!(adapter = n, "bluetooth adapter removed");
+                    watch.observe(false);
+                }
+                Some(SessionEvent::AdapterAdded(n)) => debug!(adapter = n, "bluetooth adapter added"),
+                None => bail!("bluez adapter event stream ended"),
+            },
+            on = adapter_events => match on {
+                Some(on) => {
+                    debug!(on, "bluetooth adapter powered changed");
+                    if !on {
+                        watch.observe(false);
+                    }
+                }
+                None => debug!("bluetooth adapter event stream ended"),
+            },
+            _ = sleep(Duration::from_secs(60)) => trace!("bluetooth adapter watch: poll"),
+        }
+    }
+}
+
+async fn restart_kdeconnectd_for_bt(
+    ctx: &Ctx,
+    session: &bluer::Session,
+    watch: &mut logic::BtAdapterWatch,
+    last_restart: &mut Option<Instant>,
+) {
+    sleep(logic::BT_ADAPTER_SETTLE).await;
+    if let Some(t) = *last_restart {
+        let since = t.elapsed();
+        if since < logic::BT_ADAPTER_RESTART_GAP {
+            let wait = logic::BT_ADAPTER_RESTART_GAP - since;
+            debug!(
+                wait_s = wait.as_secs(),
+                "bluetooth adapter back: restart gap"
+            );
+            sleep(wait).await;
+        }
+    }
+    let (usable, _) = bt_adapter_state(session).await;
+    if !usable {
+        debug!("bluetooth adapter gone again during settle: waiting for it");
+        watch.observe(false);
+        return;
+    }
+    match crate::kde::unit_active().await {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!("bluetooth adapter back: kdeconnectd unit not active, nothing to restart");
+            return;
+        }
+        Err(e) => {
+            warn!("bluetooth adapter back: is kdeconnectd's unit active: {e:#}");
+            return;
+        }
+    }
+    // Bluetooth provider off (pause, or disabled by hand): kdeconnectd doesn't use the adapter.
+    match crate::kde::Kde::connect().await {
+        Ok(kde) => {
+            match tokio::time::timeout(Duration::from_secs(10), kde.link_providers()).await {
+                Ok(Ok(p)) if !p.iter().any(|(id, on)| id == "bluetooth" && *on) => {
+                    debug!(
+                        "bluetooth adapter back: kdeconnectd bluetooth provider off, not restarting"
+                    );
+                    return;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    debug!("bluetooth adapter back: link providers: {e:#}, restarting anyway")
+                }
+                Err(_) => {
+                    debug!("bluetooth adapter back: link providers timed out, restarting anyway")
+                }
+            }
+        }
+        Err(e) => debug!("bluetooth adapter back: session bus: {e:#}, restarting anyway"),
+    }
+    info!("bluetooth adapter back: restarting kdeconnectd so it picks the adapter up again");
+    *last_restart = Some(Instant::now());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let restart_error = match crate::kde::restart().await {
+        Ok(()) => None,
+        Err(e) => {
+            error!("kdeconnectd restart after bluetooth adapter came back failed: {e:#}");
             Some(format!("{e:#}"))
         }
     };

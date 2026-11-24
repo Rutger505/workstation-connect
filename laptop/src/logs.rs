@@ -37,7 +37,7 @@ pub enum Reason {
     Update,
     Start,
     Selftest,
-    /// kdeconnectd watchdog restarted (or tried to restart) a hung kdeconnectd.
+    /// kdeconnectd restarted (or tried): hung (watchdog), or the Bluetooth adapter came back.
     KdeRestart,
 }
 

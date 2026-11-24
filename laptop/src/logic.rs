@@ -153,9 +153,51 @@ impl KdeWatchdog {
     }
 }
 
+/// Adapter back: wait this long before restarting kdeconnectd (MT7921 needs ~2.5 s of setup
+/// after btusb loads; Powered can flap meanwhile).
+pub const BT_ADAPTER_SETTLE: Duration = Duration::from_secs(3);
+/// At most one adapter-triggered kdeconnectd restart per this gap (a flapping adapter).
+pub const BT_ADAPTER_RESTART_GAP: Duration = Duration::from_secs(30);
+
+/// Bluetooth adapter usable = present and powered. kdeconnectd's Bluetooth backend looks for an
+/// adapter only at start and resume ("No local bluetooth adapter found") and never again, so
+/// after a gap (btusb reloaded on suspend, rfkill, bluetoothd restart) it needs a restart.
+#[derive(Debug, Default)]
+pub struct BtAdapterWatch {
+    usable: Option<bool>,
+}
+
+impl BtAdapterWatch {
+    /// Returns true when the adapter just came back after being seen gone. The first
+    /// observation never counts: kdeconnectd's own start covers that state.
+    pub fn observe(&mut self, usable: bool) -> bool {
+        let back = self.usable == Some(false) && usable;
+        self.usable = Some(usable);
+        back
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bt_adapter_back_only_after_a_gap() {
+        let mut w = BtAdapterWatch::default();
+        assert!(!w.observe(true), "startup state never counts");
+        assert!(!w.observe(true));
+        assert!(!w.observe(false));
+        assert!(!w.observe(false));
+        assert!(w.observe(true), "back after gone");
+        assert!(!w.observe(true), "once per gap");
+    }
+
+    #[test]
+    fn bt_adapter_absent_at_start_then_back() {
+        let mut w = BtAdapterWatch::default();
+        assert!(!w.observe(false));
+        assert!(w.observe(true));
+    }
 
     #[test]
     fn kde_watchdog_restarts_after_two_hangs() {
