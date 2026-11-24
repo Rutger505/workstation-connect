@@ -91,6 +91,26 @@ impl Kde {
             .context("kdeconnectd not running? (kdeconnectd / kdeconnect-indicator)")
     }
 
+    /// Reachable but unpaired devices as "name (id)": tells "phone not visible" apart from
+    /// "visible, pairing missing" (e.g. after a fresh app install with a new device id).
+    async fn unpaired_reachable(&self) -> Result<Vec<String>> {
+        let daemon = self.proxy(ROOT.into(), "org.kde.kdeconnect.daemon").await?;
+        let ids: Vec<String> = daemon
+            .call("devices", &(true, false))
+            .await
+            .context("kdeconnectd devices")?;
+        let mut out = Vec::new();
+        for id in ids {
+            let dev = self.device(&id, None, "org.kde.kdeconnect.device").await?;
+            if dev.get_property::<bool>("isPaired").await.unwrap_or(false) {
+                continue;
+            }
+            let name: String = dev.get_property("name").await.unwrap_or_default();
+            out.push(format!("{name} ({id})"));
+        }
+        Ok(out)
+    }
+
     /// The phone: `want` (device id or name) if set, else the first paired smartphone/tablet.
     pub async fn find_phone(&self, want: Option<&str>) -> Result<String> {
         let ids = self.paired().await?;
@@ -116,7 +136,19 @@ impl Kde {
         debug!(paired = ids.len(), want = ?want, "kde connect: no matching device");
         match want {
             Some(w) => bail!("no paired KDE Connect device '{w}'"),
-            None => bail!("no paired phone in KDE Connect: pair it from the phone app first"),
+            None => {
+                let seen = match self.unpaired_reachable().await {
+                    Ok(v) if v.is_empty() => {
+                        "phone not visible to KDE Connect either (same network? app running?)".into()
+                    }
+                    Ok(v) => format!("visible but unpaired: {}", v.join(", ")),
+                    Err(e) => {
+                        format!("unpaired devices unknown: {e:#}")
+                    }
+                };
+                debug!(%seen, "kde connect: no paired phone");
+                bail!("no paired phone in KDE Connect: pair it from the phone app first; {seen}")
+            }
         }
     }
 
