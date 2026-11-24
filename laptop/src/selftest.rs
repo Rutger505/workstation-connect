@@ -353,6 +353,11 @@ async fn section_kde(want: Option<&str>) -> Vec<Step> {
     }
     steps.push(Step::pass("loaded plugins", None, info.plugins.join(", ")));
     steps.push(portal_step());
+    steps.push(match crate::kde::package_patched().await {
+        Some(true) => Step::pass("kdeconnect BT patch", None, "patched build installed"),
+        Some(false) => Step::fail("kdeconnect BT patch", None, crate::kde::PATCH_HINT),
+        None => Step::skip("kdeconnect BT patch", "pacman -Qi kdeconnect unavailable"),
+    });
     if info.reachable {
         let t = Instant::now();
         steps.push(Step::timed(

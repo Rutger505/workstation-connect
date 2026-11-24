@@ -232,6 +232,14 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
         crate::update::VERSION_LONG
     );
     debug!(socket = %socket_path().display(), "tasks starting");
+    match crate::kde::package_patched().await {
+        Some(true) => debug!("kdeconnect: patched build installed"),
+        Some(false) => warn!(
+            "kdeconnect is not the patched build: {}",
+            crate::kde::PATCH_HINT
+        ),
+        None => debug!("kdeconnect package state unknown"),
+    }
     ctx.uploader.trigger(Reason::Start);
 
     // Mirror the phone link into the status.

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Builds + installs Arch's kdeconnect with bluetooth-no-discovery-while-linked.patch.
+# Run again after every kdeconnect update from pacman (selftest / daemon log say when).
+# DRY_RUN=1: build only, don't install.
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+patch="$here/bluetooth-no-discovery-while-linked.patch"
+marker="workstation-connect"   # Packager field; kde.rs checks for it
+log() { printf 'kdeconnect-build: %s\n' "$*" >&2; }
+
+if command -v checkupdates >/dev/null && checkupdates >/dev/null; then
+  log "system has pending updates; run 'sudo pacman -Syu' first (no partial upgrades)"
+  exit 1
+fi
+
+ver="$(pacman -Si kdeconnect | sed -n 's/^Version *: //p' | head -1)"
+[[ -n "$ver" ]] || { log "kdeconnect not found in sync db"; exit 1; }
+tag="${ver/:/-}"
+log "building kdeconnect $ver (packaging tag $tag)"
+
+work="$(mktemp -d /tmp/kdeconnect-build.XXXXXX)"
+trap 'rm -rf "$work"' EXIT
+git clone -q --depth 1 --branch "$tag" \
+  https://gitlab.archlinux.org/archlinux/packaging/packages/kdeconnect.git "$work/pkg"
+cd "$work/pkg"
+
+# Suffix pkgrel: newer than Arch's same build, older than its next rebuild (which drops the patch).
+sed -i -E 's/^pkgrel=([0-9]+)$/pkgrel=\1.1/' PKGBUILD
+grep -qE '^pkgrel=[0-9]+\.1$' PKGBUILD || { log "unexpected pkgrel line in PKGBUILD"; exit 1; }
+
+export PACKAGER="$marker patched build <noreply@localhost>"
+makepkg -o --nodeps --noconfirm   # fetch + PGP-verify + extract
+src="$(find src -maxdepth 1 -type d -name 'kdeconnect-kde-*' | head -1)"
+[[ -n "$src" ]] || { log "source dir not found"; exit 1; }
+patch -d "$src" -p1 --forward < "$patch"
+log "patch applied to $src"
+
+if [[ "${DRY_RUN:-}" == 1 ]]; then
+  makepkg -e --syncdeps --rmdeps --noconfirm
+  cp ./*.pkg.tar.zst /tmp/
+  log "DRY_RUN: built, copied to /tmp, not installed"
+  exit 0
+fi
+makepkg -e --syncdeps --rmdeps --install --noconfirm
+log "installed; restarting kdeconnectd"
+systemctl --user restart app-org.kde.kdeconnect.daemon@autostart.service

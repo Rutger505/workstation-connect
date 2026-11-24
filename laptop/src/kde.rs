@@ -29,6 +29,48 @@ pub const QT_LOGGING_RULES: &str = "kdeconnect.core.debug=true";
 const DROPIN_DIR: &str = "systemd/user/app-org.kde.kdeconnect.daemon@.service.d";
 const DROPIN_FILE: &str = "workstation-connect-logging.conf";
 
+/// Packager marker of our patched kdeconnect build (`laptop/kdeconnect/build`).
+const PATCHED_MARKER: &str = "workstation-connect";
+/// Shown when the installed kdeconnect isn't our patched build.
+pub const PATCH_HINT: &str = "run laptop/kdeconnect/build in the workstation-connect checkout \
+     (Bluetooth discovery while linked lags the trackpad ~0.5 s)";
+
+/// Whether the installed kdeconnect is our patched build (no Bluetooth discovery while a
+/// peer is linked). `None`: not installed via pacman / pacman unavailable.
+pub async fn package_patched() -> Option<bool> {
+    let out = tokio::time::timeout(
+        SYSTEMCTL_TIMEOUT,
+        tokio::process::Command::new("pacman")
+            .args(["-Qi", "kdeconnect"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let out = match out {
+        Ok(Ok(o)) if o.status.success() => o,
+        Ok(Ok(o)) => {
+            debug!(status = %o.status, "pacman -Qi kdeconnect failed");
+            return None;
+        }
+        Ok(Err(e)) => {
+            debug!("pacman: {e}");
+            return None;
+        }
+        Err(_) => {
+            debug!("pacman -Qi kdeconnect timed out");
+            return None;
+        }
+    };
+    Some(packager_is_patched(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn packager_is_patched(qi: &str) -> bool {
+    qi.lines().any(|l| {
+        l.split_once(':')
+            .is_some_and(|(k, v)| k.trim() == "Packager" && v.contains(PATCHED_MARKER))
+    })
+}
+
 /// kdeconnectd's state as seen by a probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
@@ -711,6 +753,14 @@ pub fn file_url(path: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_patched_package() {
+        let ours = "Name            : kdeconnect\nPackager        : workstation-connect patched build <noreply@localhost>\n";
+        let arch = "Name            : kdeconnect\nPackager        : Antonio Rojas <arojas@archlinux.org>\n";
+        assert!(packager_is_patched(ours));
+        assert!(!packager_is_patched(arch));
+    }
 
     #[test]
     fn parses_providers() {

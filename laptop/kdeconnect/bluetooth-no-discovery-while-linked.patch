@@ -1,0 +1,29 @@
+diff --git a/core/backends/bluetooth/bluetoothlinkproviderimpl.cpp b/core/backends/bluetooth/bluetoothlinkproviderimpl.cpp
+index b487be9..0165479 100644
+--- a/core/backends/bluetooth/bluetoothlinkproviderimpl.cpp
++++ b/core/backends/bluetooth/bluetoothlinkproviderimpl.cpp
+@@ -41,6 +41,13 @@ void BluetoothLinkProviderImpl::onStart()
+ void BluetoothLinkProviderImpl::onStartDiscovery()
+ {
+     if (!mDisabled && mServiceDiscoveryAgent != nullptr) {
++        // workstation-connect: inquiry + SDP paging steal radio time from the live link
++        // (0.5 s input lag on MT7921), so only search while no Bluetooth peer is linked.
++        if (!mLinks.isEmpty()) {
++            qCDebug(KDECONNECT_CORE) << "BluetoothLinkProviderImpl::onStartDiscovery skipped, links:" << mLinks.size();
++            mServiceDiscoveryAgent->stop();
++            return;
++        }
+         qCDebug(KDECONNECT_CORE) << "BluetoothLinkProviderImpl::onStartDiscovery executed";
+         mServiceDiscoveryAgent->start();
+     }
+@@ -134,6 +141,10 @@ void BluetoothLinkProviderImpl::addLink(BluetoothDeviceLink *deviceLink, const Q
+         delete mLinks.take(deviceId); // not calling deleteLater because this triggers onLinkDestroyed
+     }
+     mLinks[deviceId] = deviceLink;
++    if (mServiceDiscoveryAgent != nullptr && mServiceDiscoveryAgent->isActive()) {
++        qCDebug(KDECONNECT_CORE) << "BluetoothLinkProviderImpl::addLink stopping discovery";
++        mServiceDiscoveryAgent->stop();
++    }
+ }
+ 
+ void BluetoothLinkProviderImpl::serviceDiscovered(const QBluetoothServiceInfo &old_info)

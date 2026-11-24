@@ -50,6 +50,7 @@ link up while awake, reconnecting when it drops. Several laptops may be connecte
 **Laptop**
 ```
 sudo pacman -S kdeconnect   # engine; also: scrcpy android-tools zenity (optional actions)
+laptop/kdeconnect/build     # patched kdeconnect, see "kdeconnect patch"; again after every kdeconnect update
 systemctl --user start app-org.kde.kdeconnect.daemon@autostart.service   # not a bare kdeconnectd, see trackpad
 cargo install --git https://github.com/Rutger505/workstation-connect workstation-connect
 mkdir -p ~/.config/workstation-connect ~/.config/systemd/user
@@ -222,3 +223,11 @@ Phone: see `WSCONNECT.md` in the app repo.
 
 `spike/hotspot`: minimal app that starts tethering via Shizuku and logs timings.
 `spike/measure <nm-connection>`: time to link, time to internet, download speed.
+
+**kdeconnect patch** (`laptop/kdeconnect/`): stock kdeconnectd runs a Bluetooth inquiry + SDP
+paging every 30 s even while the phone is linked over BT; on the MT7921 that steals radio time
+from the link (trackpad p90 ~0.5 s late). The patch skips discovery while any BT peer is linked
+(fine for one phone; a second BT peer isn't found meanwhile). `build` rebuilds Arch's current
+kdeconnect package with it (pkgrel `N.1`, Packager `workstation-connect …`), so Arch's next
+kdeconnect release replaces it unpatched: the daemon warns at start and `selftest` fails
+("kdeconnect BT patch") until `build` runs again. `DRY_RUN=1`: build to /tmp only.
