@@ -1,5 +1,5 @@
 //! Classic Bluetooth (RFCOMM) protocol, keep in sync with
-//! android/app/src/main/java/com/rutger/wsconnect/Proto.kt.
+//! workstation-connect-android: workstation-connect/java/com/rutger/workstationconnect/Proto.kt.
 //! v5: RFCOMM stream of `[len: u8][payload]` frames instead of BLE GATT; len 0 = keepalive.
 
 use serde::Serialize;
