@@ -9,11 +9,6 @@ patch="$here/bluetooth-no-discovery-while-linked.patch"
 marker="workstation-connect"   # Packager field; kde.rs checks for it
 log() { printf 'kdeconnect-build: %s\n' "$*" >&2; }
 
-if command -v checkupdates >/dev/null && checkupdates >/dev/null; then
-  log "system has pending updates; run 'sudo pacman -Syu' first (no partial upgrades)"
-  exit 1
-fi
-
 ver="$(pacman -Si kdeconnect | sed -n 's/^Version *: //p' | head -1)"
 [[ -n "$ver" ]] || { log "kdeconnect not found in sync db"; exit 1; }
 tag="${ver/:/-}"
