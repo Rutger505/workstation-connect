@@ -9,6 +9,7 @@ Phone app: Rutger505/workstation-connect-android (KDE Connect fork, its own AGEN
 - **Git**: commit + push straight to `main`, no branches/PRs (except big renames). Public repo, MIT.
 - `laptop/`: Rust `workstation-connect` (daemon, waybar, menu, clip/send/browse/screen, setup, update, selftest). bluer 0.17 + zbus 5 + nmcli + ureq. `spike/`: phase 0 experiments.
 - Check: `cd laptop && cargo test && cargo clippy` (clean), `cargo build --release`.
+- **Logging**: every change ships with `tracing` lines (setup `logging.rs`, config `log_level`/RUST_LOG): state changes `info`, decisions/skips/timings `debug`, failures `warn`/`error` with context (`{e:#}`), no silently swallowed errors, changes not repeats in loops. Never secrets or content (clipboard, notifications, keys).
 - **Protocol** change: README section + `proto.rs` + app's `Proto.kt` together; bump `VERSION` in `Proto.kt` (phone reports it). Cmds 2/4 and flag 2 retired: never reuse.
 - `build.rs` embeds the git commit; the update check only counts `laptop/` changes.
 - KDE Connect via D-Bus in `laptop/src/kde.rs`; API = kdeconnect-kde `core/*.h`, `plugins/*plugin.h` (Q_SCRIPTABLE/Q_PROPERTY).
