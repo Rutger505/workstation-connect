@@ -78,7 +78,8 @@ echo '{"remote": ["org.kde.kdeconnect.daemon"]}' > ~/.config/xdg-desktop-portal-
 printf '[D-BUS Service]\nName=org.kde.kdeconnect\nExec=/usr/bin/kdeconnectd\nSystemdService=app-org.kde.kdeconnect.daemon@autostart.service\n' \
   > ~/.local/share/dbus-1/services/org.kde.kdeconnect.service
 
-workstation-connect setup   # once, after pairing in the app: laptop notifications → phone, Bluetooth link, share_dir
+workstation-connect setup   # once, after pairing in the app: laptop notifications → phone, Bluetooth link, share_dir,
+                            # kdeconnectd logging drop-in (restarts kdeconnectd when it changed)
 systemctl --user enable --now workstation-connect
 journalctl --user -fu workstation-connect
 ```
@@ -105,6 +106,8 @@ becomes `["<class>", "outdated"]`.
   `~/.local/state/workstation-connect/update.failed`), menu gets **Update workstation-connect**. Log:
   `journalctl --user -u workstation-connect-update`.
 - `auto_update = false`: only the marker; menu gets **Update workstation-connect**.
+kdeconnectd hung (watchdog, below): text gets `󰄢`, class adds `kde-hung`, tooltip + menu info line
+say so.
 Phone not paired over classic Bluetooth (or bond lost): text gets `󰀦`, class `not-paired`; pair it
 in the Bluetooth menu. Phone paged fine but its RFCOMM service didn't answer 3 tries in a row (app
 not running / no Bluetooth permission): `󰀦`, class `service-missing`.
@@ -125,13 +128,27 @@ restart. No file: upload off (one info line).
   `~/.local/state/workstation-connect/upload.cursor`; first time: last hour), plus best effort the system
   journal of `bluetooth.service` and Bluetooth kernel lines (needs journal read access). Newest
   ~1 MB.
-- Reasons: `start` (daemon start, so also after an update), `link-ok` / `link-fail` (phone link
+- Reasons: `kde-restart` (watchdog restarted or failed to restart kdeconnectd, below), `start` (daemon start, so also after an update), `link-ok` / `link-fail` (phone link
   connected / 3 connects failed in a row outside the 20 s after resume), `hotspot-ok` /
   `hotspot-fail` (hotspot join outcome), `update` (auto-update failed), `periodic` (every 10 min
   while online, only with new lines), `selftest`. Triggers within 5 s become one upload.
 - Failed upload: cursor stays, reason kept, retried at the next trigger or network reconnect.
 - The daemon logs KDE Connect changes (reachable, link types, loaded plugins, D-Bus errors) and its
   own KDE Connect actions, so input/notification/clipboard problems show up there too.
+- kdeconnectd itself logs almost nothing by default. `setup` writes
+  `~/.config/systemd/user/app-org.kde.kdeconnect.daemon@.service.d/workstation-connect-logging.conf`
+  (`Environment=QT_LOGGING_RULES=kdeconnect.core.debug=true`): discovery, link up/down, pairing,
+  plugin loading. No `kdeconnect.plugin.*` (clipboard/notification content). Applies from the next
+  kdeconnectd start; Qt debug lines are journal priority 7, the upload takes all priorities.
+
+**kdeconnectd watchdog**: kdeconnectd can hang with its name still on D-Bus (main thread stuck,
+every call times out, pairing silently fails). Every kdeconnectd call has a 30 s timeout. The daemon
+probes it every 2 min (`selfId`, 5 s timeout; sooner, ≥30 s apart, when a KDE Connect call timed
+out), also while paused. Not on the bus = fine (D-Bus activation starts it). 2 hung probes in a row:
+logs its threads' kernel wait channels, `systemctl --user restart app-org.kde.kdeconnect.daemon@autostart.service`,
+log upload; at most one restart per 10 min (skip logged once). Running outside that unit: no
+restart, error in the status. Status `kde_health`: `state` = `unknown | ok | not_running | hung`,
+`last_restart` (unix s), `restart_error`.
 
 **Selftest**: `workstation-connect selftest [--no-hotspot] [--no-send]` prints PASS/FAIL/SKIP per step with
 timings (exit code 1 on any FAIL):
@@ -143,7 +160,7 @@ timings (exit code 1 on any FAIL):
   restore): phone on → hotspot flag → join `hotspot_connection` → GET
   `http://ping.archlinux.org/nm-check.txt` → phone off → previous Wi-Fi back (also on error/timeout).
   Already on the hotspot: left on.
-- d. KDE Connect: kdeconnectd on D-Bus, phone device, paired, reachable + link types, key plugins
+- d. KDE Connect: kdeconnectd answers (hung: FAIL, rest skipped), logging drop-in, kdeconnectd on D-Bus, phone device, paired, reachable + link types, key plugins
   (mousepad, remotekeyboard, remotecontrol, notifications, sendnotifications, clipboard, ping),
   trackpad portal config, KDE Connect ping to the phone. D-Bus errors verbatim.
 - Then: report + logs uploaded (reason `selftest`), report handed to Rocky with
@@ -158,7 +175,8 @@ done; at once while an auto-update runs), `watch` (status line on every change),
 errors `{"error": "…"}`. Status has `version` (the running daemon's, `v<n>`) and `commit` (its full build commit),
 `update` (only when outdated: `installed`, `latest`, `state` = `available | updating | failed`) and
 `update_check` (last finished check: `at` unix seconds, `outcome` = `up_to_date | outdated | failed`,
-`latest` short commit, `error`; null before the first check or with an unknown build commit).
+`latest` short commit, `error`; null before the first check or with an unknown build commit),
+`kde_health` (kdeconnectd watchdog, see above).
 
 CLI: `workstation-connect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update | logs-key | selftest`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
