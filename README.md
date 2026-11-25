@@ -231,3 +231,6 @@ from the link (trackpad p90 ~0.5 s late). The patch skips discovery while any BT
 kdeconnect package with it (pkgrel `N.1`, Packager `workstation-connect …`), so Arch's next
 kdeconnect release replaces it unpatched: the daemon warns at start and `selftest` fails
 ("kdeconnect BT patch") until `build` runs again. `DRY_RUN=1`: build to /tmp only.
+Compiles go through ccache (`~/.cache/workstation-connect/kdeconnect`, max 3G), unchanged
+files are reused across versions (26.08.2 → 26.08.3: 262/312 hits, 9 → 3 min); already
+patched current version → exits right away, `FORCE=1` rebuilds.

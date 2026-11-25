@@ -1,20 +1,43 @@
 #!/usr/bin/env bash
 # Builds + installs Arch's kdeconnect with bluetooth-no-discovery-while-linked.patch.
 # Run again after every kdeconnect update from pacman (selftest / daemon log say when).
-# DRY_RUN=1: build only, don't install.
+# Compiles go through ccache (cache in ~/.cache/workstation-connect/kdeconnect): unchanged
+# source files are reused across kdeconnect versions; Qt/KF6/gcc updates recompile what they touch.
+# DRY_RUN=1: build only, don't install. FORCE=1: rebuild even if this version is already patched.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 patch="$here/bluetooth-no-discovery-while-linked.patch"
 marker="workstation-connect"   # Packager field; kde.rs checks for it
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/workstation-connect/kdeconnect"
 log() { printf 'kdeconnect-build: %s\n' "$*" >&2; }
 
 ver="$(pacman -Si kdeconnect | sed -n 's/^Version *: //p' | head -1)"
 [[ -n "$ver" ]] || { log "kdeconnect not found in sync db"; exit 1; }
 tag="${ver/:/-}"
-log "building kdeconnect $ver (packaging tag $tag)"
 
-work="$(mktemp -d /tmp/kdeconnect-build.XXXXXX)"
+installed="$(pacman -Q kdeconnect 2>/dev/null | cut -d' ' -f2 || true)"
+if [[ "$installed" == "$ver.1" && "${FORCE:-}" != 1 && "${DRY_RUN:-}" != 1 ]] \
+  && pacman -Qi kdeconnect | grep -q "^Packager *: $marker"; then
+  log "patched kdeconnect $installed already installed, nothing to do (FORCE=1 rebuilds)"
+  exit 0
+fi
+log "building kdeconnect $ver (packaging tag $tag, installed: ${installed:-none})"
+
+mkdir -p "$cache/sources" "$cache/ccache"
+exec 9>"$cache/lock"
+flock -n 9 || { log "another build is running ($cache/lock)"; exit 1; }
+
+if ! command -v ccache >/dev/null; then
+  log "installing ccache"
+  sudo pacman -S --needed --noconfirm ccache
+fi
+export CCACHE_DIR="$cache/ccache" CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-3G}"
+ccache -z >/dev/null
+
+# Fixed path (not mktemp): absolute paths end up in compile flags + debug info, so they're part of the ccache key.
+work="$cache/work"
+rm -rf "$work"
 trap 'rm -rf "$work"' EXIT
 git clone -q --depth 1 --branch "$tag" \
   https://gitlab.archlinux.org/archlinux/packaging/packages/kdeconnect.git "$work/pkg"
@@ -24,24 +47,48 @@ cd "$work/pkg"
 sed -i -E 's/^pkgrel=([0-9]+)$/pkgrel=\1.1/' PKGBUILD
 grep -qE '^pkgrel=[0-9]+\.1$' PKGBUILD || { log "unexpected pkgrel line in PKGBUILD"; exit 1; }
 
+# System + user makepkg config, plus ccache; --config skips the user config, so source it here.
+cat >"$work/makepkg.conf" <<EOF
+source /etc/makepkg.conf
+for c in /etc/makepkg.conf.d/*.conf; do [[ -r \$c ]] && source "\$c"; done
+for c in "\${XDG_CONFIG_HOME:-\$HOME/.config}/pacman/makepkg.conf" "\$HOME/.makepkg.conf"; do
+  [[ -r \$c ]] && { source "\$c"; break; }
+done
+BUILDENV+=(ccache)
+EOF
+export SRCDEST="$cache/sources"   # tarball + signature reused when the version didn't change
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
+mk() { makepkg --config "$work/makepkg.conf" "$@"; }
+
 export PACKAGER="$marker patched build <noreply@localhost>"
 # Release-signing keys ship in the packaging repo; throwaway keyring so the user's stays untouched.
 export GNUPGHOME="$work/gnupg"
 mkdir -m 700 "$GNUPGHOME"
 gpg --batch --quiet --import keys/pgp/*.asc
 log "imported $(ls keys/pgp/*.asc | wc -l) signing key(s) into temp keyring"
-makepkg -o --nodeps --noconfirm   # fetch + PGP-verify + extract
+mk -o --nodeps --noconfirm   # fetch + PGP-verify + extract
 src="$(find src -maxdepth 1 -type d -name 'kdeconnect-kde-*' | head -1)"
 [[ -n "$src" ]] || { log "source dir not found"; exit 1; }
+
+# Version-free source dir: otherwise every path (and so every ccache key) changes with the version.
+if grep -q -- '-S \$pkgname-kde-\$pkgver' PKGBUILD; then
+  mv "$src" src/kdeconnect-kde
+  src=src/kdeconnect-kde
+  sed -i 's/-S \$pkgname-kde-\$pkgver/-S kdeconnect-kde/' PKGBUILD
+else
+  log "warn: PKGBUILD build() layout changed; ccache only helps reruns of the same version"
+fi
 patch -d "$src" -p1 --forward < "$patch"
 log "patch applied to $src"
 
 if [[ "${DRY_RUN:-}" == 1 ]]; then
-  makepkg -e --syncdeps --rmdeps --noconfirm
+  mk -e --syncdeps --rmdeps --noconfirm
+  log "ccache: $(ccache --print-stats | awk -F'\t' '/^direct_cache_hit|^preprocessed_cache_hit|^cache_miss/{printf "%s=%s ", $1, $2}')"
   cp ./*.pkg.tar.zst /tmp/
   log "DRY_RUN: built, copied to /tmp, not installed"
   exit 0
 fi
-makepkg -e --syncdeps --rmdeps --install --noconfirm
+mk -e --syncdeps --rmdeps --install --noconfirm
+log "ccache: $(ccache --print-stats | awk -F'\t' '/^direct_cache_hit|^preprocessed_cache_hit|^cache_miss/{printf "%s=%s ", $1, $2}')"
 log "installed; restarting kdeconnectd"
 systemctl --user restart app-org.kde.kdeconnect.daemon@autostart.service
