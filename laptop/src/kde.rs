@@ -103,18 +103,18 @@ pub struct DeviceInfo {
     pub reachable: bool,
     /// Active link types, e.g. ["LanLinkProvider"].
     pub providers: Vec<String>,
-    pub connection: String,
+    /// Link summary; None on kdeconnectd releases without the property (added after 26.08).
+    pub connection: Option<String>,
     /// Loaded plugin ids, sorted, e.g. "kdeconnect_mousepad".
     pub plugins: Vec<String>,
     /// D-Bus errors reading the above, verbatim (older kdeconnectd lacks some properties).
     pub errors: Vec<String>,
 }
 
-/// Plugins worth calling out: (id, what it's for).
-pub const KEY_PLUGINS: [(&str, &str); 7] = [
+/// Plugins worth calling out: (id, what it's for). Not remotekeyboard/remotecontrol: they need
+/// the phone-side receivers the app deliberately dropped (typing = scrcpy).
+pub const KEY_PLUGINS: [(&str, &str); 5] = [
     ("kdeconnect_mousepad", "trackpad/mouse input"),
-    ("kdeconnect_remotekeyboard", "keyboard input"),
-    ("kdeconnect_remotecontrol", "remote control"),
     ("kdeconnect_notifications", "phone notifications"),
     (
         "kdeconnect_sendnotifications",
@@ -399,13 +399,18 @@ impl Kde {
                 note("activeProviderNames", e);
                 vec![]
             });
-        let connection = dev
-            .get_property::<String>("connectionDescription")
-            .await
-            .unwrap_or_else(|e| {
+        let connection = match dev.get_property::<String>("connectionDescription").await {
+            Ok(c) => Some(c),
+            // Only on kdeconnect-kde master (d03d131b8), not in 26.08.x releases.
+            Err(zbus::Error::FDO(e)) if matches!(*e, zbus::fdo::Error::UnknownProperty(_)) => {
+                debug!("kdeconnectd has no connectionDescription property, skipping");
+                None
+            }
+            Err(e) => {
                 note("connectionDescription", e);
-                String::new()
-            });
+                None
+            }
+        };
         let mut plugins = dev
             .call::<_, _, Vec<String>>("loadedPlugins", &())
             .await
@@ -651,12 +656,25 @@ pub async fn pause_sync(on: bool) -> Result<()> {
     Ok(())
 }
 
+/// `["LanLinkProvider"] (description)`, without the description where kdeconnectd lacks it.
+pub fn links(d: &DeviceInfo) -> String {
+    match d.connection.as_deref() {
+        Some(c) if !c.is_empty() => format!("{:?} ({c})", d.providers),
+        _ => format!("{:?}", d.providers),
+    }
+}
+
 /// Log lines for a change of the phone's KDE Connect device (all of it when `prev` is None).
 pub fn describe_change(prev: Option<&DeviceInfo>, new: &DeviceInfo) -> Vec<String> {
     let Some(p) = prev.filter(|p| p.id == new.id) else {
         let mut l = vec![format!(
-            "kde connect: {} ({}) paired={} reachable={} links={:?} ({}) plugins={:?}",
-            new.name, new.id, new.paired, new.reachable, new.providers, new.connection, new.plugins
+            "kde connect: {} ({}) paired={} reachable={} links={} plugins={:?}",
+            new.name,
+            new.id,
+            new.paired,
+            new.reachable,
+            links(new),
+            new.plugins
         )];
         l.extend(new.errors.iter().map(|e| format!("kde connect: D-Bus {e}")));
         return l;
@@ -670,8 +688,10 @@ pub fn describe_change(prev: Option<&DeviceInfo>, new: &DeviceInfo) -> Vec<Strin
         || p.connection != new.connection
     {
         l.push(format!(
-            "kde connect: {} reachable={} links={:?} ({})",
-            new.name, new.reachable, new.providers, new.connection
+            "kde connect: {} reachable={} links={}",
+            new.name,
+            new.reachable,
+            links(new)
         ));
     }
     let added: Vec<_> = new
@@ -778,7 +798,7 @@ mod tests {
             paired: true,
             reachable: true,
             providers: vec!["LanLinkProvider".into()],
-            connection: "Connected via LAN".into(),
+            connection: Some("Connected via LAN".into()),
             plugins: vec!["kdeconnect_mousepad".into(), "kdeconnect_ping".into()],
             errors: vec![],
         }

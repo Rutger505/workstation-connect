@@ -326,7 +326,7 @@ async fn section_kde(want: Option<&str>) -> Vec<Step> {
     } else {
         Step::fail("paired", None, "no: pair from the phone app")
     });
-    let links = format!("links {:?} ({})", info.providers, info.connection);
+    let links = format!("links {}", crate::kde::links(&info));
     steps.push(if info.reachable {
         Step::pass("reachable", None, links)
     } else {
