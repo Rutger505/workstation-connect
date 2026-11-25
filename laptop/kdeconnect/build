@@ -3,6 +3,7 @@
 # Run again after every kdeconnect update from pacman (selftest / daemon log say when).
 # Compiles go through ccache (cache in ~/.cache/workstation-connect/kdeconnect): unchanged
 # source files are reused across kdeconnect versions; Qt/KF6/gcc updates recompile what they touch.
+# Asks for sudo up front; built package kept in the cache, so a failed install reruns without rebuilding.
 # DRY_RUN=1: build only, don't install. FORCE=1: rebuild even if this version is already patched.
 set -euo pipefail
 
@@ -24,9 +25,33 @@ if [[ "$installed" == "$ver.1" && "${FORCE:-}" != 1 && "${DRY_RUN:-}" != 1 ]] \
 fi
 log "building kdeconnect $ver (packaging tag $tag, installed: ${installed:-none})"
 
-mkdir -p "$cache/sources" "$cache/ccache"
+mkdir -p "$cache/sources" "$cache/ccache" "$cache/pkg"
 exec 9>"$cache/lock"
 flock -n 9 || { log "another build is running ($cache/lock)"; exit 1; }
+
+# Built packages are kept in $cache/pkg: a failed install (e.g. sudo prompt timed out) never costs a rebuild.
+pkgfile() { find "$cache/pkg" -maxdepth 1 -name "kdeconnect-${ver}.1-*.pkg.tar.*" ! -name '*-debug-*' | head -1; }
+install_pkg() {
+  local pkg="$1"
+  log "installing $(basename "$pkg")"
+  if ! sudo pacman -U --noconfirm "$pkg"; then
+    log "error: install failed; built package kept, rerun this script (no rebuild) or: sudo pacman -U $pkg"
+    exit 1
+  fi
+  log "installed; restarting kdeconnectd"
+  systemctl --user restart app-org.kde.kdeconnect.daemon@autostart.service
+}
+if [[ "${DRY_RUN:-}" != 1 && "${FORCE:-}" != 1 && -n "$(pkgfile)" ]]; then
+  log "patched package for $ver already built, skipping build"
+  install_pkg "$(pkgfile)"
+  exit 0
+fi
+# Ask for sudo now (deps + install need it), not after a 15 min build; keep it alive meanwhile.
+if [[ "${DRY_RUN:-}" != 1 ]]; then
+  sudo -v
+  ( while sleep 50; do sudo -n -v 2>/dev/null || exit; done ) &
+  sudo_keepalive=$!
+fi
 
 if ! command -v ccache >/dev/null; then
   log "installing ccache"
@@ -38,7 +63,7 @@ ccache -z >/dev/null
 # Fixed path (not mktemp): absolute paths end up in compile flags + debug info, so they're part of the ccache key.
 work="$cache/work"
 rm -rf "$work"
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "$work"; [[ -n "${sudo_keepalive:-}" ]] && kill "$sudo_keepalive" 2>/dev/null; true' EXIT
 git clone -q --depth 1 --branch "$tag" \
   https://gitlab.archlinux.org/archlinux/packaging/packages/kdeconnect.git "$work/pkg"
 cd "$work/pkg"
@@ -88,7 +113,10 @@ if [[ "${DRY_RUN:-}" == 1 ]]; then
   log "DRY_RUN: built, copied to /tmp, not installed"
   exit 0
 fi
-mk -e --syncdeps --rmdeps --install --noconfirm
+mk -e --syncdeps --rmdeps --noconfirm
 log "ccache: $(ccache --print-stats | awk -F'\t' '/^direct_cache_hit|^preprocessed_cache_hit|^cache_miss/{printf "%s=%s ", $1, $2}')"
-log "installed; restarting kdeconnectd"
-systemctl --user restart app-org.kde.kdeconnect.daemon@autostart.service
+rm -f "$cache/pkg"/kdeconnect-*.pkg.tar.*
+cp ./kdeconnect-*.pkg.tar.* "$cache/pkg/"
+pkg="$(pkgfile)"
+[[ -n "$pkg" ]] || { log "error: built package not found in $cache/pkg"; exit 1; }
+install_pkg "$pkg"
