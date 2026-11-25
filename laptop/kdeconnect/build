@@ -25,6 +25,11 @@ sed -i -E 's/^pkgrel=([0-9]+)$/pkgrel=\1.1/' PKGBUILD
 grep -qE '^pkgrel=[0-9]+\.1$' PKGBUILD || { log "unexpected pkgrel line in PKGBUILD"; exit 1; }
 
 export PACKAGER="$marker patched build <noreply@localhost>"
+# Release-signing keys ship in the packaging repo; throwaway keyring so the user's stays untouched.
+export GNUPGHOME="$work/gnupg"
+mkdir -m 700 "$GNUPGHOME"
+gpg --batch --quiet --import keys/pgp/*.asc
+log "imported $(ls keys/pgp/*.asc | wc -l) signing key(s) into temp keyring"
 makepkg -o --nodeps --noconfirm   # fetch + PGP-verify + extract
 src="$(find src -maxdepth 1 -type d -name 'kdeconnect-kde-*' | head -1)"
 [[ -n "$src" ]] || { log "source dir not found"; exit 1; }
