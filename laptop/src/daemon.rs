@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use futures::{StreamExt, pin_mut};
 use serde::Serialize;
 use std::collections::HashSet;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -57,6 +58,16 @@ pub struct Status {
     pub update_check: Option<crate::update::Check>,
     /// kdeconnectd watchdog.
     pub kde_health: KdeHealth,
+    pub tailscale: TailscaleStatus,
+}
+
+/// KDE Connect over Tailscale (`tailscale_watch`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TailscaleStatus {
+    /// Laptop's own `tailscale0` IPv4.
+    pub laptop: Option<Ipv4Addr>,
+    /// Phone's Tailscale IPv4 (last reported, kept across restarts), in kdeconnectd's custom devices.
+    pub phone: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -97,6 +108,10 @@ struct Ctx {
     check_now: tokio::sync::mpsc::Sender<crate::update::CheckRequest>,
     /// A KDE Connect call timed out: kdeconnectd watchdog probes early.
     kde_poke: tokio::sync::Notify,
+    /// Phone's KDE Connect device has a LAN link (None: unknown), from `kde_watch`.
+    kde_lan: watch::Sender<Option<bool>>,
+    /// Network changed or kdeconnectd restarted: `tailscale_watch` re-checks now.
+    tailscale_poke: tokio::sync::Notify,
 }
 
 impl Ctx {
@@ -212,6 +227,7 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
             last_restart: None,
             restart_error: None,
         },
+        tailscale: TailscaleStatus::default(),
     });
     let (check_now, check_requests) = tokio::sync::mpsc::channel(16);
     let ctx = Arc::new(Ctx {
@@ -226,6 +242,8 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
         uploader: Uploader::spawn(),
         check_now,
         kde_poke: tokio::sync::Notify::new(),
+        kde_lan: watch::channel(None).0,
+        tailscale_poke: tokio::sync::Notify::new(),
     });
     info!(
         "workstation-connect {} started",
@@ -282,6 +300,7 @@ pub async fn run(cfg: Config, log_filter: &str) -> Result<()> {
     tokio::spawn(reconnect_watch(ctx.clone(), reconnected));
     tokio::spawn(sleep_guard(ctx.clone()));
     tokio::spawn(wifi_guard(ctx.clone()));
+    tokio::spawn(tailscale_watch(ctx.clone()).instrument(info_span!("tailscale")));
     tokio::spawn(serve_socket(ctx.clone()));
 
     loop {
@@ -664,6 +683,9 @@ async fn kde_watch(ctx: Arc<Ctx>) {
                 for line in crate::kde::describe_change(last.as_ref(), &info) {
                     info!("{line}");
                 }
+                let lan = info.providers.iter().any(|p| p.starts_with("Lan"));
+                ctx.kde_lan
+                    .send_if_modified(|l| l.replace(lan) != Some(lan));
                 last = Some(info);
                 last_err = None;
             }
@@ -678,6 +700,7 @@ async fn kde_watch(ctx: Arc<Ctx>) {
                     last_err = Some(e);
                 }
                 last = None;
+                ctx.kde_lan.send_replace(None);
             }
         }
         sleep(Duration::from_secs(15)).await;
@@ -817,6 +840,7 @@ async fn restart_kdeconnectd(ctx: &Ctx, kde: Option<&crate::kde::Kde>) {
         s.kde_health.restart_error = restart_error;
     });
     ctx.uploader.trigger(Reason::KdeRestart);
+    ctx.tailscale_poke.notify_one();
 }
 
 /// Restarts kdeconnectd when the Bluetooth adapter comes back after a gap (see
@@ -988,6 +1012,7 @@ async fn restart_kdeconnectd_for_bt(
         s.kde_health.restart_error = restart_error;
     });
     ctx.uploader.trigger(Reason::KdeRestart);
+    ctx.tailscale_poke.notify_one();
 }
 
 /// Pokes the update check on every network (re)connect.
@@ -1000,9 +1025,10 @@ async fn reconnect_watch(ctx: Arc<Ctx>, reconnected: Arc<tokio::sync::Notify>) {
             let start = std::time::Instant::now();
             while events.next().await.is_some() {
                 if start.elapsed() > Duration::from_secs(5) {
-                    debug!("network (re)connected: update check, pending uploads");
+                    debug!("network (re)connected: update check, pending uploads, tailscale");
                     reconnected.notify_one();
                     ctx.uploader.retry();
+                    ctx.tailscale_poke.notify_one();
                 } else {
                     trace!("reconnect watch: initial value");
                 }
@@ -1036,6 +1062,7 @@ async fn wifi_guard(ctx: Arc<Ctx>) {
                     "wifi connection changed"
                 );
                 if logic::wifi_left(&prev.0, &new.0) {
+                    ctx.tailscale_poke.notify_one();
                     let (old, new) = (name(&prev.1), name(&new.1));
                     tokio::spawn(tell_net_changed(ctx.clone(), format!("{old} → {new}")));
                 }
@@ -1049,6 +1076,240 @@ async fn wifi_guard(ctx: Arc<Ctx>) {
         }
         sleep(Duration::from_secs(30)).await;
     }
+}
+
+/// Re-read our Tailscale IP / poll for the phone this often.
+const TS_TICK: Duration = Duration::from_secs(15);
+/// While the phone has no KDE Connect LAN link: forceOnNetworkChange this often.
+const TS_NUDGE_EVERY: Duration = Duration::from_secs(60);
+/// Re-read kdeconnectd's customDevices this often (kdeconnectd restarted by hand, edits).
+const TS_VERIFY_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// `tailscale_watch`'s memory.
+#[derive(Default)]
+struct Ts {
+    /// Our tailscale0 IPv4; outer None until first read.
+    own: Option<Option<Ipv4Addr>>,
+    own_err: Option<String>,
+    /// What the current connection's phone was told (None: nothing yet / reconnected).
+    told: Option<Ipv4Addr>,
+    send_err: Option<String>,
+    /// Phone app version we logged as too old.
+    old_app: Option<u8>,
+    /// Custom device entry we manage (persisted), and the phone's latest IP.
+    managed: Option<Ipv4Addr>,
+    phone: Option<Ipv4Addr>,
+    verified_at: Option<Instant>,
+    nudged_at: Option<Instant>,
+    nudging: bool,
+    /// forceOnNetworkChange on the next round (network changed, custom devices set).
+    force: bool,
+    kde: Option<crate::kde::Kde>,
+    kde_err: Option<String>,
+}
+
+/// KDE Connect over Tailscale (see `tailscale.rs`): tells the phone our Tailscale IPv4 (v6+
+/// apps), keeps the phone's in kdeconnectd's custom devices and nudges kdeconnectd
+/// (forceOnNetworkChange) while the phone has no LAN link, e.g. after it switched networks.
+async fn tailscale_watch(ctx: Arc<Ctx>) {
+    let mut link_rx = ctx.phone.watch();
+    let mut events = ctx.phone.events();
+    let managed = crate::tailscale::load_managed();
+    let mut ts = Ts {
+        managed,
+        phone: managed,
+        ..Ts::default()
+    };
+    info!(phone = ?managed, "tailscale watch started");
+    ctx.set(|s| s.tailscale.phone = managed);
+    loop {
+        ts_own(&ctx, &mut ts);
+        ts_phone(&ctx, &mut ts).await;
+        if let Err(e) = ts_kde(&ctx, &mut ts).await {
+            ts.kde = None; // fresh connection next round: kdeconnectd may have restarted
+            if crate::kde::timed_out(&e) {
+                ctx.kde_poke.notify_one();
+            }
+            let e = format!("{e:#}");
+            if ts.kde_err.as_ref() != Some(&e) {
+                warn!("tailscale: kde connect: {e}");
+                ts.kde_err = Some(e);
+            }
+        } else {
+            ts.kde_err = None;
+        }
+        tokio::select! {
+            _ = sleep(TS_TICK) => {}
+            r = link_rx.changed() => if r.is_err() {
+                error!("tailscale watch: phone link task gone");
+                return;
+            },
+            ev = events.recv() => match ev {
+                Ok(LinkEvent::Connected) => {
+                    debug!("tailscale: phone (re)connected, telling it our address again");
+                    ts.told = None;
+                }
+                Ok(LinkEvent::GaveUp) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    debug!("tailscale: {n} link events missed, telling the phone again");
+                    ts.told = None;
+                }
+                Err(_) => {
+                    error!("tailscale watch: phone link events gone");
+                    return;
+                }
+            },
+            _ = ctx.tailscale_poke.notified() => {
+                debug!("tailscale: network changed or kdeconnectd restarted: re-checking now");
+                ts.force = true;
+                ts.verified_at = None;
+            }
+        }
+    }
+}
+
+fn ts_own(ctx: &Ctx, ts: &mut Ts) {
+    match crate::tailscale::own_ipv4() {
+        Ok(ip) => {
+            ts.own_err = None;
+            if ts.own != Some(ip) {
+                match ip {
+                    Some(ip) => info!(laptop = %ip, "tailscale: own address"),
+                    None => info!(
+                        "tailscale: no IPv4 in 100.64.0.0/10 on {} (Tailscale down?)",
+                        crate::tailscale::IFACE
+                    ),
+                }
+                ts.own = Some(ip);
+                ctx.set(|s| s.tailscale.laptop = ip);
+            }
+        }
+        Err(e) => {
+            let e = format!("getifaddrs: {e}");
+            if ts.own_err.as_ref() != Some(&e) {
+                warn!("tailscale: own address: {e}");
+                ts.own_err = Some(e);
+            }
+        }
+    }
+}
+
+/// Our address to the phone, the phone's address from its state.
+async fn ts_phone(ctx: &Ctx, ts: &mut Ts) {
+    let link = ctx.phone.link();
+    let Some(st) = link.state.filter(|_| link.connected) else {
+        ts.told = None;
+        return;
+    };
+    if st.version < proto::TAILSCALE_VERSION {
+        if ts.old_app != Some(st.version) {
+            info!(
+                "tailscale: phone app v{} predates the address exchange (v{}): not telling it",
+                st.version,
+                proto::TAILSCALE_VERSION
+            );
+            ts.old_app = Some(st.version);
+        }
+        return;
+    }
+    ts.old_app = None;
+    if let Some(ip) = st.tailscale
+        && ts.phone != Some(ip)
+    {
+        info!(phone = %ip, previous = ?ts.phone, "tailscale: phone reported its address");
+        ts.phone = Some(ip);
+        ts.verified_at = None;
+        ctx.set(|s| s.tailscale.phone = Some(ip));
+    }
+    // Only once our own address was read: else a startup race would send 0.0.0.0 first.
+    let Some(own) = ts.own else { return };
+    let want = own.unwrap_or(Ipv4Addr::UNSPECIFIED);
+    if ts.told == Some(want) {
+        return;
+    }
+    match ctx
+        .phone
+        .send(Cmd::TailscaleAddr(want), Duration::from_secs(3))
+        .await
+    {
+        Ok(()) => {
+            info!(laptop = %want, "tailscale: told the phone our address");
+            ts.told = Some(want);
+            ts.send_err = None;
+        }
+        Err(e) => {
+            let e = format!("{e:#}");
+            if ts.send_err.as_ref() != Some(&e) {
+                warn!("tailscale: telling the phone our address {want}: {e}");
+                ts.send_err = Some(e);
+            }
+        }
+    }
+}
+
+/// The phone's IP in kdeconnectd's custom devices; forceOnNetworkChange when needed.
+async fn ts_kde(ctx: &Ctx, ts: &mut Ts) -> Result<()> {
+    let Some(ip) = ts.phone else { return Ok(()) };
+    if *ctx.paused.borrow() {
+        trace!("tailscale: paused, leaving kdeconnectd alone");
+        return Ok(());
+    }
+    if ts.kde.is_none() {
+        ts.kde = Some(crate::kde::Kde::connect().await?);
+    }
+    let kde = ts.kde.as_ref().expect("set above");
+    if ts
+        .verified_at
+        .is_none_or(|t| t.elapsed() >= TS_VERIFY_EVERY)
+    {
+        let current = kde.custom_devices().await?;
+        let merged = crate::tailscale::merge(&current, ts.managed, ip);
+        if merged != current {
+            info!(
+                from = ?current,
+                to = ?merged,
+                "tailscale: putting the phone's address in kdeconnectd's custom devices"
+            );
+            kde.set_custom_devices(&merged).await?;
+            ts.force = true;
+        } else {
+            debug!(phone = %ip, "tailscale: phone already in kdeconnectd's custom devices");
+        }
+        if ts.managed != Some(ip) {
+            crate::tailscale::save_managed(ip).context("remembering the managed custom device")?;
+            debug!(phone = %ip, "tailscale: managed custom device saved");
+            ts.managed = Some(ip);
+        }
+        ts.verified_at = Some(Instant::now());
+    }
+    // No LAN link (only Bluetooth, or not reachable): the phone may sit in another network.
+    // Without our own Tailscale address a unicast to it can't leave the laptop anyway.
+    let lan = *ctx.kde_lan.borrow();
+    let nudge = lan == Some(false) && ts.own.flatten().is_some();
+    if nudge != ts.nudging {
+        if nudge {
+            info!(
+                phone = %ip,
+                every_s = TS_NUDGE_EVERY.as_secs(),
+                "tailscale: phone has no KDE Connect LAN link: nudging kdeconnectd"
+            );
+        } else {
+            info!(lan = ?lan, "tailscale: stopped nudging kdeconnectd");
+        }
+        ts.nudging = nudge;
+    }
+    let due = nudge && ts.nudged_at.is_none_or(|t| t.elapsed() >= TS_NUDGE_EVERY);
+    if ts.force || due {
+        kde.force_network_change().await?;
+        debug!(
+            forced = ts.force,
+            nudge = due,
+            "tailscale: kdeconnectd re-announced"
+        );
+        ts.force = false;
+        ts.nudged_at = Some(Instant::now());
+    }
+    Ok(())
 }
 
 fn name(id: &str) -> &str {

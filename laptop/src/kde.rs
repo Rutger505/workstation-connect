@@ -514,6 +514,53 @@ impl Kde {
     }
 }
 
+/// Custom devices: addresses kdeconnectd sends its UDP identity to besides the LAN broadcast
+/// (`Q_PROPERTY customDevices` on `org.kde.kdeconnect.daemon`, exported via
+/// ExportScriptableContents; kdeconnectd persists it in its config).
+impl Kde {
+    /// Uncached: kdeconnectd (Qt) doesn't emit PropertiesChanged, a cached value goes stale.
+    async fn daemon_uncached(&self) -> Result<Proxy<'static>> {
+        Ok(zbus::proxy::Builder::<Proxy<'static>>::new(&self.conn)
+            .destination(DEST)?
+            .path(ROOT)?
+            .interface("org.kde.kdeconnect.daemon")?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await?)
+    }
+
+    pub async fn custom_devices(&self) -> Result<Vec<String>> {
+        let daemon = self.daemon_uncached().await?;
+        daemon
+            .get_property::<Vec<String>>("customDevices")
+            .await
+            .context("kdeconnectd customDevices")
+    }
+
+    /// kdeconnectd saves the list and, when it changed, runs forceOnNetworkChange itself.
+    pub async fn set_custom_devices(&self, list: &[String]) -> Result<()> {
+        let daemon = self.daemon_uncached().await?;
+        daemon
+            .set_property("customDevices", list.to_vec())
+            .await
+            .context("kdeconnectd set customDevices")?;
+        info!(?list, "kde connect: custom devices set");
+        Ok(())
+    }
+
+    /// Re-announce on every link provider: LAN sends its UDP identity to the broadcast address
+    /// and every custom device (debounced by kdeconnectd); Bluetooth only re-checks its server.
+    pub async fn force_network_change(&self) -> Result<()> {
+        let daemon = self.proxy(ROOT.into(), "org.kde.kdeconnect.daemon").await?;
+        daemon
+            .call::<_, _, ()>("forceOnNetworkChange", &())
+            .await
+            .context("kdeconnectd forceOnNetworkChange")?;
+        debug!("kde connect: forceOnNetworkChange");
+        Ok(())
+    }
+}
+
 /// A kdeconnectd call ran into the [`CALL`] timeout (kdeconnectd possibly hung).
 pub fn timed_out(e: &anyhow::Error) -> bool {
     e.chain().any(|c| match c.downcast_ref::<zbus::Error>() {

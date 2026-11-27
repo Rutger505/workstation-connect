@@ -14,6 +14,7 @@ mod proto;
 mod sdp;
 mod selftest;
 mod sigv4;
+mod tailscale;
 mod update;
 
 use anyhow::Result;

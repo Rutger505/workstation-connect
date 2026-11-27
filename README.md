@@ -24,6 +24,17 @@ Phone ↔ laptop link for a Pixel 9 and an Arch/Hyprland laptop.
 5. Suspend or pause (waybar click): phone off. Laptop gone for 3 min (Bluetooth link lost): the phone turns
    itself off.
 
+**KDE Connect over Tailscale**: without a shared LAN (eduroam client isolation, school Wi-Fi with the
+hotspot off) KDE Connect's UDP broadcast never reaches the phone. Both run Tailscale, so each side
+puts the other's Tailscale IPv4 in its KDE Connect custom devices (exchanged over Bluetooth, protocol
+v6). Laptop: own address = IPv4 in 100.64.0.0/10 on `tailscale0` (checked every 15 s and on network
+changes); the phone's goes into kdeconnectd's `customDevices` (D-Bus property), merged: entries added
+by hand stay, the daemon's own entry (`~/.local/state/workstation-connect/kdeconnect-custom-device`)
+is replaced when the phone's IP changes. Then `forceOnNetworkChange`; again after every laptop
+network change and kdeconnectd restart, and every 60 s while the phone's KDE Connect device has no
+LAN link (phone switched networks). Re-checked every 5 min. Paused: left alone. Status `tailscale`:
+`laptop`, `phone`.
+
 Protocol v6 (both sides: `Proto.kt` in the app, `proto.rs`): classic Bluetooth (BR/EDR) RFCOMM,
 service UUID `6f2b0010-3c1d-4e8a-9f41-7a5d2c9e0b10`, SDP name "Workstation Connect", channel via SDP
 (laptop does its own SDP lookup, cached until a connect fails; not BlueZ ConnectProfile, which
@@ -83,6 +94,11 @@ echo '{"remote": ["org.kde.kdeconnect.daemon"]}' > ~/.config/xdg-desktop-portal-
 # start kdeconnectd in its app unit so the portal knows its app ID, also when D-Bus activates it
 printf '[D-BUS Service]\nName=org.kde.kdeconnect\nExec=/usr/bin/kdeconnectd\nSystemdService=app-org.kde.kdeconnect.daemon@autostart.service\n' \
   > ~/.local/share/dbus-1/services/org.kde.kdeconnect.service
+
+# KDE Connect over Tailscale: Tailscale up on both; ufw (Omarchy: default deny incoming) must let
+# KDE Connect in on tailscale0 (dev-env's workstation-connect install does this when ufw is there):
+sudo ufw allow in on tailscale0 to any port 1714:1764 proto tcp
+sudo ufw allow in on tailscale0 to any port 1714:1764 proto udp
 
 workstation-connect setup   # once, after pairing in the app: laptop notifications → phone, Bluetooth link, share_dir,
                             # kdeconnectd logging drop-in (restarts kdeconnectd when it changed)
@@ -190,7 +206,7 @@ errors `{"error": "…"}`. Status has `version` (the running daemon's, `v<n>`) a
 `update` (only when outdated: `installed`, `latest`, `state` = `available | updating | failed`) and
 `update_check` (last finished check: `at` unix seconds, `outcome` = `up_to_date | outdated | failed`,
 `latest` short commit, `error`; null before the first check or with an unknown build commit),
-`kde_health` (kdeconnectd watchdog, see above).
+`kde_health` (kdeconnectd watchdog, see above), `tailscale` (`laptop`, `phone`: Tailscale IPv4s or null, see How it works).
 
 CLI: `workstation-connect status | pause | resume | toggle | menu | clip | send [files] | browse | screen | setup | update | logs-key | selftest`.
 - `pause`: auto hotspot off and KDE Connect fully off (all link providers); `resume` restores them.
