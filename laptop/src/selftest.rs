@@ -377,6 +377,59 @@ async fn section_kde(want: Option<&str>) -> Vec<Step> {
 }
 
 /// Trackpad input needs the RemoteDesktop portal routed to luminous (README: Setup).
+/// KDE Connect over Tailscale: our address, the phone's (via the daemon), kdeconnectd's custom devices.
+async fn section_tailscale(status: &Option<Value>) -> Vec<Step> {
+    let iface = crate::tailscale::IFACE;
+    let mut steps = vec![match crate::tailscale::own_ipv4() {
+        Ok(Some(ip)) => Step::pass("laptop Tailscale address", None, format!("{ip} on {iface}")),
+        Ok(None) => Step::fail(
+            "laptop Tailscale address",
+            None,
+            format!("no IPv4 in 100.64.0.0/10 on {iface}: Tailscale up? (sudo tailscale up)"),
+        ),
+        Err(e) => Step::fail("laptop Tailscale address", None, format!("getifaddrs: {e}")),
+    }];
+    let Some(v) = status else {
+        steps.push(Step::skip(
+            "phone Tailscale address",
+            "daemon not reachable",
+        ));
+        return steps;
+    };
+    let phone = v["tailscale"]["phone"].as_str().map(str::to_string);
+    let app = v["phone"]["state"]["version"].as_u64();
+    let Some(phone) = phone else {
+        let why = match app {
+            Some(pv) if pv < u64::from(crate::proto::TAILSCALE_VERSION) => format!(
+                "phone app protocol v{pv} doesn't send it (v{} does): update the app",
+                crate::proto::TAILSCALE_VERSION
+            ),
+            Some(_) => "phone reports none: Tailscale on in the phone's Tailscale app?".into(),
+            None => "never reported: phone link not connected yet (section b)".into(),
+        };
+        steps.push(Step::fail("phone Tailscale address", None, why));
+        return steps;
+    };
+    steps.push(Step::pass("phone Tailscale address", None, &phone));
+    let t = Instant::now();
+    let custom = async { Kde::connect().await?.custom_devices().await };
+    steps.push(match custom.await {
+        Ok(list) if list.iter().any(|e| e.trim() == phone) => {
+            Step::pass("in kdeconnectd custom devices", Some(t), list.join(", "))
+        }
+        Ok(list) => Step::fail(
+            "in kdeconnectd custom devices",
+            Some(t),
+            format!(
+                "{phone} missing (daemon adds it within 15 s; paused?): [{}]",
+                list.join(", ")
+            ),
+        ),
+        Err(e) => Step::fail("in kdeconnectd custom devices", Some(t), format!("{e:#}")),
+    });
+    steps
+}
+
 fn portal_step() -> Step {
     let cfg = crate::config::xdg_config();
     let portals = cfg.join("xdg-desktop-portal/hyprland-portals.conf");
@@ -494,6 +547,12 @@ pub async fn run(no_hotspot: bool, no_send: bool) -> Result<()> {
     eprintln!("d. KDE Connect…");
     let want = cfg.as_ref().and_then(|c| c.kdeconnect_device.clone());
     sections.push(("d. KDE Connect".into(), section_kde(want.as_deref()).await));
+
+    eprintln!("e. KDE Connect over Tailscale…");
+    sections.push((
+        "e. KDE Connect over Tailscale".into(),
+        section_tailscale(&status).await,
+    ));
 
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

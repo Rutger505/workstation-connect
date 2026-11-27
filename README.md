@@ -193,6 +193,8 @@ timings (exit code 1 on any FAIL):
 - d. KDE Connect: kdeconnectd answers (hung: FAIL, rest skipped), logging drop-in, kdeconnectd on D-Bus, phone device, paired, reachable + link types, key plugins
   (mousepad, notifications, sendnotifications, clipboard, ping; no remotekeyboard/remotecontrol: app drops those receivers),
   trackpad portal config, KDE Connect ping to the phone. D-Bus errors verbatim.
+- e. KDE Connect over Tailscale: laptop has a `tailscale0` IPv4, phone reported its Tailscale IP
+  (v6 app), it's in kdeconnectd's custom devices.
 - Then: report + logs uploaded (reason `selftest`), report handed to Rocky with
   `someclaw-thread send new -` (dev-env); prints the thread URL. Fails: says so, report stays in
   the bucket.
