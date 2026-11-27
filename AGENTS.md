@@ -35,6 +35,7 @@ Phone app: Rutger505/workstation-connect-android (KDE Connect fork, its own AGEN
 - Never hold a tokio `watch` `borrow()` guard across `send`/`send_replace` on the same channel: deadlock (00509d3).
 - Never `cargo install --git` with a kept `--target-dir`: git sources aren't content-fingerprinted, it reinstalls the old build. `update` clones + `cargo install --path`.
 - kdeconnectd can hang for days with its name on the bus (every call times out, pairing silently fails): every kdeconnectd call needs a timeout (`kde.rs` `CALL`); watchdog in `daemon.rs` restarts its unit. kdeconnectd never re-finds a Bluetooth adapter that was gone (suspend unloads btusb): `bt_adapter_watch` restarts it when the adapter is back. Its own logs: QT_LOGGING_RULES drop-in from `setup`, never `kdeconnect.plugin.*` (content).
+- No shared LAN (eduroam): KDE Connect only finds the phone via custom devices = Tailscale IPs (protocol v6, `tailscale.rs`). kdeconnectd's `customDevices` is a real D-Bus property but Qt never emits PropertiesChanged: read it uncached.
 - `NetChanged` (cmd 3) exists because a dead TCP KDE Connect link stays "connected" ~15 min after the laptop leaves a Wi-Fi.
 - udev renames `bnep0` (e.g. `enp5s0f3u4`): never match a PAN iface by name.
 - Captive-portal Wi-Fi is downed first, else it keeps the default route.
@@ -44,4 +45,4 @@ Phone app: Rutger505/workstation-connect-android (KDE Connect fork, its own AGEN
 ## Hardware status
 
 - Laptop: Acer A715-42G, MT7921 (Wi-Fi + BT). Also tested on Rutger's desktop (Omarchy, Realtek USB BT).
-- Protocol v5 RFCOMM link: untested on hardware since the `btsock::settled` fix (e166f98). Auto hotspot flow untested since BT tethering was dropped.
+- Protocol v6 (Tailscale exchange): untested on hardware. v5 RFCOMM link: untested since the `btsock::settled` fix (e166f98). Auto hotspot flow untested since BT tethering was dropped.
