@@ -24,7 +24,7 @@ Phone ↔ laptop link for a Pixel 9 and an Arch/Hyprland laptop.
 5. Suspend or pause (waybar click): phone off. Laptop gone for 3 min (Bluetooth link lost): the phone turns
    itself off.
 
-Protocol v5 (both sides: `Proto.kt` in the app, `proto.rs`): classic Bluetooth (BR/EDR) RFCOMM,
+Protocol v6 (both sides: `Proto.kt` in the app, `proto.rs`): classic Bluetooth (BR/EDR) RFCOMM,
 service UUID `6f2b0010-3c1d-4e8a-9f41-7a5d2c9e0b10`, SDP name "Workstation Connect", channel via SDP
 (laptop does its own SDP lookup, cached until a connect fails; not BlueZ ConnectProfile, which
 browses a device once per bluetoothd run and then misses a service added later).
@@ -35,9 +35,14 @@ link up while awake, reconnecting when it drops. Several laptops may be connecte
   drop KDE Connect LAN links to it (sent on every change away from a Wi-Fi connection; else the dead
   TCP link stays "connected" ~15 min), `5` ping (phone answers with a state frame). `2` and `4`
   retired, never reuse.
-- Phone → laptop, state (>= 4 bytes, extra ignored): `[flags, battery %, signal 0-4|255, version]`
-  (version 5), flags: 1 Shizuku ready, 4 hotspot on, 8 wanted, 16 last command failed (2 retired).
-  Sent right after accept and on every change.
+- Laptop → phone, `6` Tailscale address (v6+ phones only): `[5, 6, a, b, c, d]`, the laptop's
+  Tailscale IPv4 in network order; `0.0.0.0` = none (phone removes it). Sent after every connect once
+  the phone's version is known, and whenever the laptop's `tailscale0` IPv4 changes. The phone
+  keeps it as KDE Connect custom device (discovery without a shared LAN).
+- Phone → laptop, state (>= 4 bytes, extra ignored): `[flags, battery %, signal 0-4|255, version,
+  tailscale a, b, c, d]` (version 6), flags: 1 Shizuku ready, 4 hotspot on, 8 wanted, 16 last
+  command failed (2 retired). Tailscale: the phone's Tailscale IPv4, `0.0.0.0` or missing (v5 and
+  older send 4 bytes) = none/unknown. Sent right after accept and on every change.
 
 ## Setup
 
